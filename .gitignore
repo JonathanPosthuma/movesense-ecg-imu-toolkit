@@ -1,2 +1,7 @@
+echo ".vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+log_1_*.sbem" > .gitignore
  
-"venv/" 

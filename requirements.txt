@@ -1,0 +1,11 @@
+asyncio==3.4.3
+bleak==0.22.2
+logging==0.4.9.6
+winrt-runtime==2.2.0
+winrt-Windows.Devices.Bluetooth==2.2.0
+winrt-Windows.Devices.Bluetooth.Advertisement==2.2.0
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile==2.2.0
+winrt-Windows.Devices.Enumeration==2.2.0
+winrt-Windows.Foundation==2.2.0
+winrt-Windows.Foundation.Collections==2.2.0
+winrt-Windows.Storage.Streams==2.2.0
