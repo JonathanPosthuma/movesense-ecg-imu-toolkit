@@ -5,3 +5,4 @@ __pycache__/
 *.log
 log_1_*.sbem" > .gitignore
  
+"venv/" 
