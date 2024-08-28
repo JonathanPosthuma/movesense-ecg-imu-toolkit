@@ -141,9 +141,10 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
         await queue.put(None)
         print("Sensor  ******" + end_of_serial + " not found!")
 
-async def main(end_of_serial: str):
+async def main(end_of_serial: str, output_dir: str):
     queue = asyncio.Queue()
-    client_task = run_ble_client(end_of_serial, queue)
-    consumer_task = run_queue_consumer(queue)
+    client_task = run_ble_client(end_of_serial, queue, output_dir)
+    consumer_task = run_queue_consumer(queue, output_dir)
     await asyncio.gather(client_task, consumer_task)
     logging.info("Main method done.")
+
