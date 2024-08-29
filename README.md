@@ -1,6 +1,9 @@
 # Movesense ECG Data Extractor
 
-![Movesense ECG Data Extractor](./assets/ICON_program.png)
+<p align="center">
+  <img src="./assets/ICON_program.png" alt="Movesense ECG Data Extractor" width="25%">
+</p>
+
 
 ## Overview
 
