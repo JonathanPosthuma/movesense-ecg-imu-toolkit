@@ -19,7 +19,7 @@ class ECGDataExtractorApp(QWidget):
         # Set window properties
         self.setWindowTitle("Movesense ECG Data Extractor")
         self.setGeometry(100, 100, 600, 400)
-        self.setWindowIcon(QIcon('output_icon.ico'))  # Set the window icon
+        self.setWindowIcon(QIcon('assets/windows_icon.ico'))  # Set the window icon
 
         # Main layout
         self.layout = QVBoxLayout()
@@ -103,7 +103,7 @@ class ECGDataExtractorApp(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon('path/to/output_icon.ico'))  # Set the application icon
+    app.setWindowIcon(QIcon('assets/windows_icon.ico'))  # Set the application icon
     window = ECGDataExtractorApp()
     window.show()
     sys.exit(app.exec_())

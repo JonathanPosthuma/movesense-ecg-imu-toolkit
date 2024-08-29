@@ -5,5 +5,4 @@ echo "*.pyo" >> .gitignore
 echo "*.log" >> .gitignore
 echo "log_1_*.sbem" >> .gitignore
 echo "venv/" >> .gitignore
-"venv/" 
-"venv/" 
+
