@@ -44,15 +44,18 @@ The **Movesense ECG Data Extractor** is a Python-based application designed for 
    cd Movesense_win_ecg_datalogger
 
 2. **Clone the Repository**:
+    ```bash
     python -m venv venv
     source venv/Scripts/activate  # On Windows
     # or
     source venv/bin/activate  # On macOS/Linux
 
 3. **Install dependencies**:
+    ```bash
     pip install -r requirements.txt
 
 4. **Run the Application**:
+    ```bash
     python gui/main_gui.py
 
 
