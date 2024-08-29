@@ -1,8 +1,7 @@
-echo ".vscode/
-__pycache__/
-*.pyc
-*.pyo
-*.log
-log_1_*.sbem" > .gitignore
- 
-"venv/" 
+echo ".vscode/" > .gitignore
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
+echo "*.pyo" >> .gitignore
+echo "*.log" >> .gitignore
+echo "log_1_*.sbem" >> .gitignore
+echo "venv/" >> .gitignore

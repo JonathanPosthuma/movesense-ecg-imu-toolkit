@@ -4,10 +4,11 @@ import os
 # Ensure the src directory is recognized as a module
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QHBoxLayout
+    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QHBoxLayout, QApplication
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon
 import asyncio
 from src.ble_client import main
 
@@ -16,15 +17,16 @@ class ECGDataExtractorApp(QWidget):
         super().__init__()
 
         # Set window properties
-        self.setWindowTitle("ECG Data Extractor")
+        self.setWindowTitle("Movesense ECG Data Extractor")
         self.setGeometry(100, 100, 600, 400)
+        self.setWindowIcon(QIcon('output_icon.ico'))  # Set the window icon
 
         # Main layout
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
         # Title Label
-        self.title_label = QLabel("ECG Data Extractor")
+        self.title_label = QLabel("Movesense ECG Data Extractor")
         self.title_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
         self.title_label.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.title_label)
@@ -101,6 +103,7 @@ class ECGDataExtractorApp(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon('path/to/output_icon.ico'))  # Set the application icon
     window = ECGDataExtractorApp()
     window.show()
     sys.exit(app.exec_())
