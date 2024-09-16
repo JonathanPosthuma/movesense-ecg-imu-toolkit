@@ -1,16 +1,18 @@
 import sys
 import os
 
-# Ensure the src directory is recognized as a module
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add the project root directory to sys.path so that 'src' can be found
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(project_root)
+
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QHBoxLayout, QApplication
+    QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QHBoxLayout
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
 import asyncio
-from src.ble_client import main
+from src.ble_client import main  # Import main from ble_client
 
 class ECGDataExtractorApp(QWidget):
     def __init__(self):
@@ -58,7 +60,7 @@ class ECGDataExtractorApp(QWidget):
         # Extract Button
         self.extract_button = QPushButton("Extract Data")
         self.extract_button.setFont(QFont("Segoe UI", 11))
-        self.extract_button.clicked.connect(self.extract_data)
+        self.extract_button.clicked.connect(self.handle_extract_data)
         self.layout.addWidget(self.extract_button)
 
         # Footer Label
@@ -84,26 +86,37 @@ class ECGDataExtractorApp(QWidget):
                 self.serial_suffixes = [line.strip() for line in file.readlines()]
             QMessageBox.information(self, "Info", f"Loaded {len(self.serial_suffixes)} serial suffixes from file.")
         
-    def extract_data(self):
+    async def run_async_ble_client(self, serial_suffix):
+        await asyncio.to_thread(main, serial_suffix, self.output_directory)
+
+    async def extract_data(self):
         if not self.output_directory:
             QMessageBox.critical(self, "Error", "Please select an output directory.")
             return
 
         if self.serial_suffixes:
+            # Run the BLE client for each serial suffix
             for suffix in self.serial_suffixes:
-                asyncio.run(main(suffix, self.output_directory))
+                await self.run_async_ble_client(suffix)
             QMessageBox.information(self, "Info", "Data extraction completed for all serial suffixes.")
         else:
             serial_suffix = self.serial_entry.text().strip()
             if serial_suffix:
-                asyncio.run(main(serial_suffix, self.output_directory))
+                await self.run_async_ble_client(serial_suffix)
                 QMessageBox.information(self, "Info", "Data extraction started. Check the logs for details.")
             else:
                 QMessageBox.critical(self, "Error", "Please enter a valid sensor serial suffix or import a file.")
 
+    def handle_extract_data(self):
+        asyncio.create_task(self.extract_data())  # Run the extraction task asynchronously
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon('assets/windows_icon.ico'))  # Set the application icon
+
+    # Set the application icon
+    app.setWindowIcon(QIcon('assets/windows_icon.ico'))
+
     window = ECGDataExtractorApp()
     window.show()
+
     sys.exit(app.exec_())

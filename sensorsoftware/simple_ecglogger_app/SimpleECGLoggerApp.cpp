@@ -63,12 +63,12 @@ bool SimpleECGLoggerApp::startModule()
     mModuleState = WB_RES::ModuleStateValues::STARTED;
 
     // Subscribe to leads detection
-    asyncSubscribe(WB_RES::LOCAL::SYSTEM_STATES_STATEID(), AsyncRequestOptions::Empty, WB_RES::StateIdValues::CONNECTOR);
+    unsubscribe(WB_RES::LOCAL::SYSTEM_STATES_STATEID(), AsyncRequestOptions::Empty, WB_RES::StateIdValues::CONNECTOR);
 
     startShutdownTimer();
 
     // Subscribe to BLE peers list changes
-    asyncSubscribe(WB_RES::LOCAL::COMM_BLE_PEERS());
+    unsubscribe(WB_RES::LOCAL::COMM_BLE_PEERS());
 
     // Check Logbook status (empty or not). The actual logging will start based on lead connection
     asyncGet(WB_RES::LOCAL::MEM_LOGBOOK_ENTRIES());
@@ -95,56 +95,30 @@ void SimpleECGLoggerApp::stopModule()
 
 void SimpleECGLoggerApp::startECGLogging()
 {
-    DEBUGLOG("startECGLogging()");
+    DEBUGLOG("Starting ECG logging");
 
-    // Configure DataLogger to record ECG and start it. Ensure timestamps and prevent overwriting
     WB_RES::DataLoggerConfig ldConfig;
     WB_RES::DataEntry entry;
-    entry.path = "/Meas/ECG/200";  // Path to ECG measurement resource
-    entry.timestamp = wb::CURRENT_TIME();  // Ensure data is timestamped
+    entry.path = "/Meas/ECG/200";
 
-    // Create an array of data entries
-    wb::DataEntryArray<WB_RES::DataEntry, 1> dataEntries;
-    dataEntries.dataEntry[0] = entry;
-    ldConfig.dataEntries = dataEntries;
+    // Correct usage of MakeArray
+    ldConfig.dataEntries = wb::MakeArray(&entry, 1);
 
-    ldConfig.appendMode = true;  // Ensure data is appended, not overwritten
-
-    // Set new config
-    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_CONFIG(), AsyncRequestOptions::ForceAsync, ldConfig);
-
-    // Subscribe to mem full notification to handle logbook full events
-    asyncSubscribe(WB_RES::LOCAL::MEM_LOGBOOK_ISFULL(), AsyncRequestOptions::ForceAsync);
-
-    // Start visual indication (e.g., LED blinking) to show that logging has started
-    asyncPut(WB_RES::LOCAL::UI_IND_VISUAL(), AsyncRequestOptions::ForceAsync,
-            WB_RES::VisualIndTypeValues::CONTINUOUS_VISUAL_INDICATION);
-
-    // Optionally, start a timer to stop the visual indication after some time
-    mStartLoggingTimer = startTimer(LED_START_LOGGING_BLINKING_TIMEOUT, false);
+    // Set new configuration
+    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_CONFIG(), AsyncRequestOptions::Empty, ldConfig);
 
     // Start Logging
-    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_STATE(), AsyncRequestOptions::ForceAsync,
-             WB_RES::DataLoggerStateValues::DATALOGGER_LOGGING);
+    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_STATE(), AsyncRequestOptions::Empty, WB_RES::DataLoggerStateValues::DATALOGGER_LOGGING);
 }
 
 void SimpleECGLoggerApp::stopECGLogging()
 {
-    DEBUGLOG("stopECGLogging()");
+    DEBUGLOG("Stopping ECG logging");
 
-    // Stop the DataLogger and set its state to READY
-    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_STATE(), AsyncRequestOptions::ForceAsync,
-             WB_RES::DataLoggerStateValues::DATALOGGER_READY);
-
-    // Stop visual indication
-    asyncPut(WB_RES::LOCAL::UI_IND_VISUAL(), AsyncRequestOptions::Empty,
-             WB_RES::VisualIndTypeValues::NO_VISUAL_INDICATIONS);
-
-    // Unsubscribe from logbook full notifications
-    asyncUnsubscribe(WB_RES::LOCAL::MEM_LOGBOOK_ISFULL());
-
-    // Optionally, handle any post-logging tasks here
+    // Stop the DataLogger
+    asyncPut(WB_RES::LOCAL::MEM_DATALOGGER_STATE(), AsyncRequestOptions::Empty, WB_RES::DataLoggerStateValues::DATALOGGER_READY);
 }
+
 
 void SimpleECGLoggerApp::onGetResult(whiteboard::RequestId requestId,
                               whiteboard::ResourceId resourceId,
@@ -172,7 +146,7 @@ void SimpleECGLoggerApp::onGetResult(whiteboard::RequestId requestId,
             else
             {
                 DEBUGLOG("Logbook not empty, staying idle waiting for connection");
-                asyncSubscribe(WB_RES::LOCAL::MEAS_HR());
+                unsubscribe(WB_RES::LOCAL::MEAS_HR());
             }
             break;
         }
@@ -200,15 +174,13 @@ void SimpleECGLoggerApp::onSubscribeResult(whiteboard::RequestId requestId,
     }
 }
 
-void SimpleECGLoggerApp::onNotify(wb::ResourceId resourceId,
-                           const wb::Value& value,
-                           const wb::ParameterList& parameters)
+void SimpleECGLoggerApp::onNotify(wb::ResourceId resourceId, const wb::Value& value, const wb::ParameterList& parameters)
 {
     switch (resourceId.localResourceId)
     {
     case WB_RES::LOCAL::SYSTEM_STATES_STATEID::LID:
     {
-        WB_RES::StateChange stateChange = value.convertTo<WB_RES::StateChange>(); 
+        WB_RES::StateChange stateChange = value.convertTo<WB_RES::StateChange>();
         if (stateChange.stateId == WB_RES::StateIdValues::CONNECTOR)
         {
             DEBUGLOG("Lead state updated. newState: %d", stateChange.newState);
@@ -216,17 +188,15 @@ void SimpleECGLoggerApp::onNotify(wb::ResourceId resourceId,
 
             if (mLeadsConnected && !mIsRecording && !mBLEConnected)
             {
-                // Start recording if leads are connected and BLE is not connected
                 startECGLogging();
                 mIsRecording = true;
             }
             else if (!mLeadsConnected && mIsRecording)
             {
-                // Stop recording if leads are disconnected
                 stopECGLogging();
                 mIsRecording = false;
             }
-        } 
+        }
         break;
     }
     case WB_RES::LOCAL::COMM_BLE_PEERS::LID:
@@ -238,7 +208,6 @@ void SimpleECGLoggerApp::onNotify(wb::ResourceId resourceId,
         {
             if (mIsRecording)
             {
-                // Stop recording if a BLE connection is established
                 stopECGLogging();
                 mIsRecording = false;
             }
@@ -250,7 +219,6 @@ void SimpleECGLoggerApp::onNotify(wb::ResourceId resourceId,
 
             if (mLeadsConnected && !mIsRecording)
             {
-                // Optionally resume recording if BLE is disconnected and leads are connected
                 startECGLogging();
                 mIsRecording = true;
             }

@@ -69,15 +69,15 @@ async def run_queue_consumer(queue: asyncio.Queue):
 async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
     global f_log
 
-    # Check if the device is available
+    print(f"Starting scan for device with serial suffix: {end_of_serial}")
     devices = await BleakScanner.discover()
     found = False
     address = None
     name = None
     for d in devices:
-        print("device:", d)
+        print(f"Discovered device: {d.address} - {d.name}")
         if d.name and d.name.endswith(end_of_serial):
-            print(f"Device found: {d.name} at {d.address}")
+            print(f"Found device with matching serial suffix: {d.name} at {d.address}")
             address = d.address
             name = d.name
             found = True
@@ -103,26 +103,30 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
 
     async def notification_handler(sender, data):
         """Simple notification handler which processes data received."""
+        print(f"Notification received from {sender}: {data}")
         d = DataView(data)
         response = d.get_uint_8(0)
         reference = d.get_uint_8(1)
 
         # Data or Data_part2
         if response == 2 or response == 3:
-            # Send data part to processor
             await queue.put(d.array[2:])
         else:
-            msg = "Data: offset: {}, len: {}".format(d.get_uint_32(2), len(d.array))
+            msg = f"Data: offset: {d.get_uint_32(2)}, len: {len(d.array)}"
             await queue.put(msg)
 
     try:
+        print(f"Attempting to connect to {name} at {address} (timeout: {timeout_seconds} seconds)")
         async with BleakClient(address, disconnected_callback=disconnect_callback, timeout=timeout_seconds) as client:
-            loop = asyncio.get_event_loop()
-            if platform.system() != "Windows":  # Avoid signal issues on Windows
+            print(f"Connected to {name} at {address}")
+            logger.info(f"Connected to {name} ({address})")
+
+            # Avoid signal issues on Windows
+            if platform.system() != "Windows":
                 signal.signal(signal.SIGINT, raise_graceful_exit)
                 signal.signal(signal.SIGTERM, raise_graceful_exit)
-           
-            logger.info("Enabling notifications")
+
+            print("Enabling notifications...")
             await client.start_notify(NOTIFY_CHARACTERISTIC_UUID, notification_handler)
 
             f_log = open(f'log_1_{name}.sbem', 'wb')
@@ -131,19 +135,19 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
             payload = {"newState": 3}
             payload_bytes = json.dumps(payload).encode('utf-8')
 
-            # Write the command to start logging (using JSON-like structure)
-            logger.info(f"Sending start logging command: {payload}")
+            print(f"Sending start logging command: {payload}")
             await client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload_bytes, response=True)
 
+            print("Waiting for notifications...")
             await disconnected_event.wait()
-            logger.info("Disconnect set by ctrl+c or real disconnect event. Check Status:")
+            print("Disconnect event detected, checking status...")
 
             if client.is_connected:
-                logger.info("Unsubscribe from notifications")
+                print("Unsubscribing from notifications...")
                 await client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([2, 99]), response=True)
-                logger.info("Stopping notifications")
+                print("Stopping notifications...")
                 await client.stop_notify(NOTIFY_CHARACTERISTIC_UUID)
-            
+
             await queue.put(None)
             await asyncio.sleep(1.0)
 
@@ -157,6 +161,8 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
 
 async def main(end_of_serial: str, output_dir: str):
     queue = asyncio.Queue()
+    print(f"Starting BLE data extraction for sensor with serial suffix: {end_of_serial}")
+    print(f"Output will be saved to: {output_dir}")
     client_task = run_ble_client(end_of_serial, queue)
     consumer_task = run_queue_consumer(queue)
     await asyncio.gather(client_task, consumer_task)
