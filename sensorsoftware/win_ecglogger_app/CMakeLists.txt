@@ -10,5 +10,7 @@ if(NOT IS_ABSOLUTE ${MOVESENSE_CORE_LIBRARY})
     set(MOVESENSE_CORE_LIBRARY ${CMAKE_BINARY_DIR}/${MOVESENSE_CORE_LIBRARY})
 endif()
 
+include_directories(../../../nea)
+
 include(${MOVESENSE_CORE_LIBRARY}/MovesenseFromStaticLib.cmake REQUIRED)
 
