@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from ble_client import main  # Since both are in the same folder, no need for 'src.'
+from ble_client import main  
 
 async def run_ble_extraction():
     if len(sys.argv) < 3:

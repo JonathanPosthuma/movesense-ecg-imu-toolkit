@@ -1,11 +1,8 @@
 import logging
 import asyncio
-import platform
-import signal
 from bleak import BleakClient, BleakScanner
 import struct
 import argparse
-from functools import reduce
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -16,69 +13,101 @@ WRITE_CHARACTERISTIC_UUID = "6b200001-ff4e-4979-8186-fb7ba486fcd7"
 NOTIFY_CHARACTERISTIC_UUID = "6b200002-ff4e-4979-8186-fb7ba486fcd7"
 
 # Constants for GATT commands
-GATT_CMD_SUBSCRIBE = 1
-GATT_CMD_UNSUBSCRIBE = 2
 GATT_CMD_FETCH_OFFLINE_DATA = 3
 GATT_CMD_INIT_OFFLINE = 4
 
-# ECG sampling
-MEAS_RESOURCE_TO_SUBSCRIBE = "/Meas/ECG/200"
-SAMPLE_RATE = 200
+# Define Responses based on server's enum
+class Responses:
+    COMMAND_RESULT = 1
+    DATA = 2
+    DATA_PART2 = 3
+    DATA_PART3 = 4
 
-f_output = None
+# Define a data structure to accumulate data parts
+class DataAccumulator:
+    def __init__(self):
+        self.data_parts = {}
+        self.expected_parts = 1  # Adjust based on protocol
+        self.received_parts = 0
 
-class DataView:
-    """Helper class to manage binary data interpretation."""
-    def __init__(self, array, bytes_per_element=1):
-        self.array = array
-        self.bytes_per_element = bytes_per_element
+    def add_part(self, part_type, data):
+        self.data_parts[part_type] = data
+        self.received_parts += 1
 
-    def __get_binary(self, start_index, byte_count, signed=False):
-        integers = [self.array[start_index + x] for x in range(byte_count)]
-        bytes = [integer.to_bytes(self.bytes_per_element, byteorder='little', signed=signed) for integer in integers]
-        return reduce(lambda a, b: a + b, bytes)
+    def is_complete(self):
+        return self.received_parts >= self.expected_parts
 
-    def get_uint_16(self, start_index):
-        return int.from_bytes(self.__get_binary(start_index, 2), byteorder='little')
+    def get_complete_data(self):
+        # Implement reassembly logic based on part types
+        complete_data = b''
+        for part in sorted(self.data_parts.keys()):
+            complete_data += self.data_parts[part]
+        return complete_data
 
-    def get_uint_8(self, start_index):
-        return int.from_bytes(self.__get_binary(start_index, 1), byteorder='little')
-
-    def get_uint_32(self, start_index):
-        return struct.unpack('<I', self.__get_binary(start_index, 4))[0]
-
-    def get_int_32(self, start_index):
-        return struct.unpack('<i', self.__get_binary(start_index, 4))[0]
-
-    def length(self):
-        return len(self.array)
-
-async def run_queue_consumer(queue: asyncio.Queue):
+async def run_queue_consumer(queue: asyncio.Queue, f_output):
     """Consumer task to process the received ECG data."""
     first_sample = True
+    data_accumulator = DataAccumulator()
+
     while True:
         data = await queue.get()
         if data is None:
             logger.info("Exiting consumer loop...")
             break
-        
-        if isinstance(data, dict) and data["type"] == "ECG":
-            if first_sample:
-                print("timestamp;ECG", file=f_output)
-                first_sample = False
 
-            timestamp = data["timestamp"]
-            dt = int(1000 / SAMPLE_RATE)
-            for sample in data["samples"]:
-                print(f"{timestamp};{sample}", file=f_output)
-                timestamp += dt
+        if isinstance(data, dict):
+            if data["type"] == "ECG":
+                if first_sample:
+                    print("timestamp;ECG", file=f_output)
+                    first_sample = False
+
+                timestamp = data["timestamp"]
+                dt = int(1000 / SAMPLE_RATE)
+                for sample in data["samples"]:
+                    print(f"{timestamp};{sample}", file=f_output)
+                    timestamp += dt
+
+            elif data["type"] in ["DATA_PART2", "DATA_PART3"]:
+                # Accumulate data parts
+                data_accumulator.add_part(data["type"], data["payload"])
+
+                if data_accumulator.is_complete():
+                    complete_data = data_accumulator.get_complete_data()
+                    # Process complete_data as needed
+                    # For example, write to file or further processing
+                    data_accumulator = DataAccumulator()  # Reset for next file
+
+            else:
+                logger.info(f"Unhandled data type: {data['type']}")
 
         else:
             logger.info(f"received: {data}")
 
-async def send_gatt_command(client, command_code, client_reference, payload=bytearray()):
-    """Send GATT command to the device."""
-    await client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([command_code, client_reference]) + payload, response=True)
+async def incoming_data_handler(sender, data, queue: asyncio.Queue):
+    """Handle incoming BLE data notifications."""
+    d = DataView(data)
+    response_code = d.get_uint_8(0)
+    reference_id = d.get_uint_8(1)
+    payload = DataView(d.array[2:])
+
+    logger.info(f"Received data: response_code={response_code}, reference_id={reference_id}")
+
+    if response_code == Responses.DATA:
+        # Main data packet
+        ts = payload.get_uint_32(0)
+        samples = [payload.get_int_32(4 + i * 4) for i in range(16)]
+        await queue.put({"type": "ECG", "timestamp": ts, "samples": samples})
+
+    elif response_code in [Responses.DATA_PART2, Responses.DATA_PART3]:
+        # Additional data parts
+        await queue.put({"type": f"DATA_PART{response_code - Responses.DATA}", "payload": payload.array})
+
+    elif response_code == Responses.COMMAND_RESULT:
+        # Handle command results if necessary
+        logger.info(f"Command Result received with reference ID: {reference_id}")
+
+    else:
+        logger.info(f"Unhandled response code: {response_code}")
 
 async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
     """Main BLE client logic, connecting to the sensor and handling data notifications."""
@@ -90,7 +119,7 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
             logger.info(f"Found device: {d.name} at {d.address}")
             address = d.address
             break
-    
+
     if not address:
         logger.error(f"Sensor with serial {end_of_serial} not found!")
         await queue.put(None)
@@ -102,34 +131,21 @@ async def run_ble_client(end_of_serial: str, queue: asyncio.Queue):
         logger.info("Disconnected callback called!")
         disconnected_event.set()
 
-    async def incoming_data_handler(sender, data):
-        d = DataView(data)
-        response_code = d.get_uint_8(0)
-        reference_id = d.get_uint_8(1)
-        payload = DataView(d.array[2:])
-
-        logger.info(f"Received data: response_code={response_code}, reference_id={reference_id}")
-        if response_code == 2 and payload.length() == 68:
-            # ECG Data
-            ts = payload.get_uint_32(0)
-            samples = [payload.get_int_32(4 + i * 4) for i in range(16)]
-            await queue.put({"type": "ECG", "timestamp": ts, "samples": samples})
-
     async with BleakClient(address, disconnected_callback=disconnect_callback) as client:
         logger.info("Connected to the device")
 
         # Start notifications
-        await client.start_notify(NOTIFY_CHARACTERISTIC_UUID, incoming_data_handler)
+        await client.start_notify(NOTIFY_CHARACTERISTIC_UUID, lambda sender, data: asyncio.create_task(incoming_data_handler(sender, data, queue)))
         logger.info("Notifications enabled")
 
-        # Subscribe to ECG data
-        await send_gatt_command(client, GATT_CMD_SUBSCRIBE, 99, bytearray(MEAS_RESOURCE_TO_SUBSCRIBE, 'utf-8'))
+        # Send FETCH_OFFLINE_DATA command if required
+        await send_gatt_command(client, GATT_CMD_FETCH_OFFLINE_DATA, 99)
+        # Implement MEAS_RESOURCE_TO_SUBSCRIBE if needed or remove
 
         # Wait for disconnection event or Ctrl-C
         await disconnected_event.wait()
 
-        # Unsubscribe and stop notifications before disconnecting
-        await send_gatt_command(client, GATT_CMD_UNSUBSCRIBE, 99)
+        # Stop notifications before disconnecting
         await client.stop_notify(NOTIFY_CHARACTERISTIC_UUID)
 
 async def main(args):
@@ -137,11 +153,13 @@ async def main(args):
 
     if args.output:
         f_output = open(args.output, "wt")
+    else:
+        f_output = None
 
     try:
         queue = asyncio.Queue()
         client_task = run_ble_client(args.end_of_serial, queue)
-        consumer_task = run_queue_consumer(queue)
+        consumer_task = run_queue_consumer(queue, f_output)
         await asyncio.gather(client_task, consumer_task)
     finally:
         if f_output:
