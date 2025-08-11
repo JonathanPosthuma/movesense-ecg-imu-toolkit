@@ -5,3 +5,11 @@ __pycache__/
 *.log
 log_1_*.sbem
 venv/
+.venv/
+venv/
+MovesenseTool/venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
