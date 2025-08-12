@@ -33,15 +33,18 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
 1. **Clone the repository**
    ```bash
    git clone https://github.com/JonathanPosthuma/movesense-ecg-imu-toolkit.git
+   ```
 
 2. **Launch virtual environment**
    ```bash
-   cd movesense-ecg-imu-toolkit
+   cd /movesense-ecg-imu-toolkit
    source venv/bin/activate
+   ```
 
 2a. **Launch application**
    ```bash
    python pc-extractor-parser/main.py
+   ```
 
 
 2b. **Build the application**
@@ -53,13 +56,15 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
     --add-data "gui:gui" \
     --collect-submodules bleak.backends.corebluetooth \
     gui/main_window.py
+    ```
 
 3. **Find and run the application**
     ```text
-├── pc-extractor-parser
-│   ├── dist
-│   │   ├── Movesense Toolkit
-│   │   └── Movesense Toolkit.app
+    ├── pc-extractor-parser
+    │   ├── dist
+    │   │   ├── Movesense Toolkit
+    │   │   └── Movesense Toolkit.app
+    ```
 
 ## Software Usage
 
