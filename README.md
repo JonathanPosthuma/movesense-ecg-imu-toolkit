@@ -1,73 +1,66 @@
-# Movesense ECG Data Extractor
+# Movesense ECG & IMU Toolkit
 
 <p align="center">
-  <img src="./assets/ICON_program.png" alt="Movesense ECG Data Extractor" width="25%">
+  <img src="pc-extractor-parser/icons/my_icon.png" alt="Movesense Toolkit Icon" width="25%">
 </p>
-
 
 ## Overview
 
-The **Movesense ECG Data Extractor** is a Python-based application designed for seamless extraction and management of ECG data from Movesense sensors. The application provides a user-friendly graphical interface that allows data extraction from multiple sensors, and save the results in an organized manner. Below there is an explanation on how to compile the script yourself or alter source code where needed, for less tech-savy users I provide an executable which can be used straight away.
-
+The **Movesense ECG & IMU Toolkit** is a Python-based GUI application for extracting long offline recordings from Movesense sensors and converting them into CSV. It supports both **ECG** and **IMU** streams, handles multiple sensors, and names output files using dynamic **ParticipantID + date + day** convention.
+For non-technical users, you can ship a one-click macOS app; for developers, you can run from source or customize.
 
 ## Features
 
-- **Simple Interface**: Easy-to-use graphical user interface (GUI) built with PyQt5.
-- **Batch Processing**: Ability to import a list of sensor serial numbers and extract data from each sensor in a single operation.
-- **Customizable Output**: Users can set their desired output directory for saving extracted data files.
-- **Built-in data preprocessing**: Application processes raw data and provides users with HRV measures.
-- **Easy to operate with sensorsoftware**: This repo contains the sensor software used on the movesense sensors.
+- **Simple GUI (PyQt5):** Start/stop extraction and monitor sensor status at a glance.
+- **Dynamic sensor list:** Load a CSV mapping of `sensor_last6,participantID` to drive the grid and file naming.
+- **Batch extraction:** Extract from multiple sensors in one go; conversion runs automatically after extraction.
+- **Consistent file naming:** Output CSVs named `ParticipantID_DDMMYY_day.csv` (e.g., `3VSAN2PR_040625_3.csv`).
+- **Built-in conversion:** Parses SBEM logs (ECG mV packets & new IMU6 format) into tidy CSV.
+- **Sensor software included:** Repo also contains the Movesense sensor-side software you use.
 
-## Installation
+## Requirements
 
-### Prerequisites
+- **macOS** with Bluetooth (tested on Apple Silicon).
+- **Python 3.12** recommended (3.11 also works).
+- Movesense sensors with logging enabled. Software can be found in sensor-software.
 
-- Python 3.6 or later
-- Pip (Python package installer)
-- Movesense sensor(s)
+> Windows builds are possible but require different BLE backends; this README focuses on **macOS**.
 
-
-## Usage
-
-## Usage
-
-1. **Start the Application**: Launch the application by running the `main_gui.py` script.
-2. **Enter Sensor Serial Suffix**: Input the last digits of the sensor serial number in the provided field.
-3. **Select Output Directory**: Choose a directory where the extracted data will be saved.
-4. **Import Serial Suffixes File**: Optionally, import a text file containing multiple sensor serial suffixes for batch processing.
-5. **Extract Data**: Click the 'Extract Data' button to begin the extraction process. The application will handle the rest, saving the data in the specified directory.
+## Quick Start (run distributable appplication)
+1. **Navigate to DIST folder**
+├── pc-extractor-parser
+│   ├── dist
+│   │   ├── Movesense Toolkit
+│   │   └── Movesense Toolkit.app
 
 
+## Quick Start (run from source)
 
-### Setup
-
-1. **Clone the Repository**:
+1. **Clone the repository**
    ```bash
-   git clone https://github.com/JonathanPosthuma/Movesense_win_ecg_datalogger.git
-   cd Movesense_win_ecg_datalogger
+   git clone https://github.com/JonathanPosthuma/movesense-ecg-imu-toolkit.git
 
-2. **Clone the Repository**:
-    ```bash
-    python -m venv venv
-    source venv/Scripts/activate  # On Windows
-    # or
-    source venv/bin/activate  # On macOS/Linux
+2. **Launch virtual environment**
+   cd movesense-ecg-imu-toolkit
+   source venv/bin/activate
 
-3. **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
+2. **Launch application**
+   python pc-extractor-parser/main.py
 
-4. **Run the Application**:
-    ```bash
-    python gui/main_gui.py
+## Software Usage
+
+1. **Load sensorID and ParticipantID's list**
+    Example CSV can be found (movesense-ecg-imu-toolkit/pc-extractor-parser/test_list.csv)
 
 
-## Acknowledgments
+2. **Select output folders**
+    Raw data folder will store the raw .SBEM folder whilst the converted folder will contain the converted CSV files
 
-- **Radboud University**: Special thanks to Movesense for support in development of this tool.
-- **Jonathan Posthuma**: Lead developer and maintainer of the project.
+3. **(Reset sensors)**
+    If sensors are still running you can reset them by pressing extract whilst in reset mode.
 
-## Contact
+4. **Extract data**
+    Click on extract in extract mode. Activate sensors four at a time by touching both pins. After extraction and conversion is completed sensors will be reset and data will be deleted of the sensors.
 
-For any questions, suggestions, or issues, please contact Jonathan Posthuma at Jonathan.posthuma@ru.nl
-
+5. **Sensors are ready for use**
+    Sensors are ready to be activated again by connecting both pins; these are very sensitive so try not to let them connect in the mean time. 

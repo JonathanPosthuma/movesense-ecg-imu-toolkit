@@ -1,15 +1,3 @@
-.vscode/
-__pycache__/
-*.pyc
-*.pyo
-*.log
-log_1_*.sbem
-venv/
 .venv/
-venv/
-MovesenseTool/venv/
 __pycache__/
 *.pyc
-dist/
-build/
-*.spec

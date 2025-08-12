@@ -1,0 +1,54 @@
+.
+├── README.md
+├── STRUCTURE.txt
+├── fetcher-parser
+│   ├── fetch_logbook_data.py
+│   └── parser_imu_ecg.py
+├── pc-extractor-parser
+│   ├── DATA
+│   │   ├── Converted
+│   │   └── Raw
+│   ├── Movesense Toolkit.spec
+│   ├── README.MD
+│   ├── assets
+│   │   ├── AppIcon.iconset
+│   │   └── app.icns
+│   ├── build
+│   │   └── Movesense Toolkit
+│   ├── config
+│   │   └── settings.json
+│   ├── conversion
+│   │   ├── __init__.py
+│   │   └── converter.py
+│   ├── dist
+│   │   ├── Movesense Toolkit
+│   │   └── Movesense Toolkit.app
+│   ├── extraction
+│   │   ├── __init__.py
+│   │   └── extractor.py
+│   ├── gui
+│   │   ├── __init__.py
+│   │   └── main_window.py
+│   ├── icons
+│   │   └── my_icon.png
+│   ├── logs
+│   │   └── app.log
+│   ├── main.py
+│   ├── requirements.txt
+│   └── test_list.csv
+├── requirements.txt
+└── sensor-software
+    ├── Flowchart_sensorsoftware.rtf
+    ├── Movesense_dfu.zip
+    ├── Movesense_dfu_w_bootloader.zip
+    └── win_ecglogger_app
+        ├── CMakeLists.txt
+        ├── ECGIMULoggerapp.cpp
+        ├── ECGIMULoggerapp.h
+        ├── SimpleQueue.cpp
+        ├── SimpleQueue.h
+        ├── app.cpp
+        ├── app_root.yaml
+        └── wbresources
+
+22 directories, 30 files
