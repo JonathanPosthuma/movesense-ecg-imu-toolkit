@@ -1,8 +1,6 @@
-# Movesense ECG & IMU Toolkit
+# Movesense ECG & IMU Toolkit 
 
-<p align="center">
-  <img src="pc-extractor-parser/icons/my_icon.png" alt="Movesense Toolkit Icon" width="25%">
-</p>
+
 
 ## Overview
 
@@ -37,15 +35,17 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
    git clone https://github.com/JonathanPosthuma/movesense-ecg-imu-toolkit.git
 
 2. **Launch virtual environment**
+   ```bash
    cd movesense-ecg-imu-toolkit
    source venv/bin/activate
 
 2a. **Launch application**
+   ```bash
    python pc-extractor-parser/main.py
 
-OR
 
 2b. **Build the application**
+    ```bash
     pyinstaller --noconfirm --windowed \                                                           
     --name "Movesense Toolkit" \
     --icon assets/app.icns \
@@ -55,6 +55,7 @@ OR
     gui/main_window.py
 
 3. **Find and run the application**
+    ```text
 ├── pc-extractor-parser
 │   ├── dist
 │   │   ├── Movesense Toolkit
@@ -77,3 +78,5 @@ OR
 
 5. **Sensors are ready for use**
     Sensors are ready to be activated again by connecting both pins; these are very sensitive so try not to let them connect in the mean time. 
+
+
