@@ -1,3 +1,12 @@
 .venv/
 __pycache__/
 *.pyc
+
+pc-extractor-parser/dist/
+pc-extractor-parser/build/
+.DS_Store
+.vscode/
+.idea/
+pc-extractor-parser/logs/
+*.sbem
+pc-extractor-parser/logs/

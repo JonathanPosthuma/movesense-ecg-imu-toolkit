@@ -27,11 +27,7 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
 > Windows builds are possible but require different BLE backends; this README focuses on **macOS**.
 
 ## Quick Start (run distributable appplication)
-1. **Navigate to DIST folder**
-├── pc-extractor-parser
-│   ├── dist
-│   │   ├── Movesense Toolkit
-│   │   └── Movesense Toolkit.app
+
 
 
 ## Quick Start (run from source)
@@ -44,8 +40,25 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
    cd movesense-ecg-imu-toolkit
    source venv/bin/activate
 
-2. **Launch application**
+2a. **Launch application**
    python pc-extractor-parser/main.py
+
+OR
+
+2b. **Build the application**
+    pyinstaller --noconfirm --windowed \                                                           
+    --name "Movesense Toolkit" \
+    --icon assets/app.icns \
+    --add-data "icons:icons" \
+    --add-data "gui:gui" \
+    --collect-submodules bleak.backends.corebluetooth \
+    gui/main_window.py
+
+3. **Find and run the application**
+├── pc-extractor-parser
+│   ├── dist
+│   │   ├── Movesense Toolkit
+│   │   └── Movesense Toolkit.app
 
 ## Software Usage
 
