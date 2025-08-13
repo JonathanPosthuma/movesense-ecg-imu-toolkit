@@ -13,4 +13,3 @@ endif()
 include_directories(../../../nea)
 
 include(${MOVESENSE_CORE_LIBRARY}/MovesenseFromStaticLib.cmake REQUIRED)
-
