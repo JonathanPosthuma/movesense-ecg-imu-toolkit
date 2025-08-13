@@ -1,0 +1,22 @@
+# Ignore docs and generated files in stats
+docs/**                     linguist-documentation
+**/build/**                 linguist-generated
+**/dist/**                  linguist-generated
+**/site/**                  linguist-generated
+**/*.min.js                 linguist-generated
+**/*.map                    linguist-generated
+**/*.html                   linguist-detectable=false
+**/*.tex                    linguist-detectable=false
+
+# If you vendor third-party code or SDKs, mark them vendored so they don't dominate
+third_party/**              linguist-vendored
+vendor/**                   linguist-vendored
+extern/**                   linguist-vendored
+MovesenseCoreLib/**         linguist-vendored
+
+# (Optional) Make sure code files are counted as the right languages
+*.cpp                       linguist-language=C++
+*.cxx                       linguist-language=C++
+*.hpp                       linguist-language=C++
+*.h                         linguist-language=C++
+*.py                        linguist-language=Python
