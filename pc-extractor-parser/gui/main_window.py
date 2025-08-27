@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 
 # Import SENSOR_LIST and the asynchronous extraction function.
-from extraction.extractor import SENSOR_LIST, extract_sensor, send_stop_logging
+from extraction.extractor import extract_sensor, send_stop_logging
 # Import the conversion function.
 import conversion.converter as conv
 
@@ -87,12 +87,16 @@ class ExtractionThread(QtCore.QThread):
         self.sensor_map = sensor_map or {}
         self.day_number = day_number or 1
 
-    def _build_target_name(self, sensor_last6: str) -> str:
+    def build_target_name(self, sensor_last6):
         pid = self.sensor_map.get(sensor_last6)
         if not pid:
+            logging.debug(f"[target] no pid for last6={sensor_last6}")
             return ""
         date_str = datetime.now().strftime("%d%m%y")
-        return f"{pid}_{date_str}_{self.day_number}.csv"
+        day_str = str(self.day_number or 1)
+        target = f"{pid}_{date_str}_{day_str}.csv"
+        logging.debug(f"[target] {sensor_last6} -> {target}")
+        return target
 
     def _safe_rename(self, src: str, dst: str) -> str:
         base, ext = os.path.splitext(dst)
@@ -101,6 +105,7 @@ class ExtractionThread(QtCore.QThread):
         while os.path.exists(candidate):
             candidate = f"{base}_{i}{ext}"
             i += 1
+        logging.debug(f"[os.replace] {src} -> {candidate}")
         os.replace(src, candidate)
         return candidate
     
@@ -192,16 +197,24 @@ class ExtractionThread(QtCore.QThread):
                             logging.info(f"Converting file {file_path} for sensor {sensor_id}...")
                             try:
                                 csv_path = await loop.run_in_executor(executor, conv.convert_sbem, file_path, self.conv_folder)
-                                if csv_path and os.path.exists(csv_path):
-                                    target_name = self._build_target_name(sensor_id)
-                                    if target_name:
-                                        target_path = os.path.join(self.conv_folder, target_name)
-                                        final_path = self._safe_rename(csv_path, target_path)
-                                        logging.info(f"Converted and renamed to {final_path}")
-                                    else:
-                                        logging.info(f"Converted (no mapping for {sensor_id}); kept {csv_path}")
-                                else:
-                                    logging.error(f"Conversion did not produce a CSV for {file_path}")
+                                logging.debug(f"[convert] converter returned: {csv_path} for {file_path}")
+
+                                if not csv_path or not os.path.exists(csv_path):
+                                    logging.warning(f"[skip] No CSV produced for {file_path}; skipping rename.")
+                                    # proceed to next extracted file without failing the sensor run
+                                    continue
+
+                                # Use the known last6 sensor_id from this extraction
+                                target_name = self.build_target_name(sensor_id)
+                                logging.debug(f"[rename] target_name={target_name} for sensor_id={sensor_id}")
+                                if not target_name:
+                                    logging.info(f"[keep] No mapping for {sensor_id}; keeping {csv_path}")
+                                    continue
+
+                                target_path = os.path.join(self.conv_folder, target_name)
+                                logging.debug(f"[rename] {csv_path} -> {target_path}")
+                                final_path = self._safe_rename(csv_path, target_path)
+                                logging.info(f"[ok] Converted and renamed to {final_path}")
                             except Exception as e:
                                 logging.error(f"Conversion failed for {file_path}: {e}")
                     else:
@@ -456,10 +469,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Return desired CSV filename using mapping and current date. Example: PID_040625_3.csv"""
         pid = self.sensor_map.get(sensor_last6)
         if not pid:
+            logging.debug(f"[target] no pid for last6={sensor_last6}")
             return ""
         date_str = datetime.now().strftime("%d%m%y")  # European DDMMYY
         day_str = str(self.day_number or 1)
-        return f"{pid}_{date_str}_{day_str}.csv"
+        target = f"{pid}_{date_str}_{day_str}.csv"
+        logging.debug(f"[target] {sensor_last6} -> {target}")
+        return target
 
     def safe_rename(self, src: str, dst: str) -> str:
         """Rename src to dst; if dst exists, append _1, _2, ... Returns final path."""
@@ -469,16 +485,26 @@ class MainWindow(QtWidgets.QMainWindow):
         while os.path.exists(candidate):
             candidate = f"{base}_{i}{ext}"
             i += 1
+        logging.debug(f"[os.replace] {src} -> {candidate}")
         os.replace(src, candidate)
         return candidate
 
-    def guess_sensor_from_filename(self, filename: str) -> str:
-        """Try to find a 6-digit sensor suffix in the filename that exists in the mapping."""
-        for m in re.finditer(r"(\d{6,})", filename):
-            last6 = m.group(1)[-6:]
+    def guess_sensor_from_filename(self, filename):
+        """Try to guess sensor last6 digits from the filename."""
+        digits = re.findall(r'\d+', filename)
+        logging.debug(f"[DEBUG] Filename: {filename}")
+        logging.debug(f"[DEBUG] Digit runs found: {digits}")
+        logging.debug(f"[DEBUG] Mapping keys available: {list(self.sensor_map.keys())}")
+
+        for d in digits:
+            last6 = d[-6:]
+            logging.debug(f"[DEBUG] Checking digits {d} → last6 = {last6}")
             if last6 in self.sensor_map:
+                logging.debug(f"[DEBUG] Match found: {last6} → {self.sensor_map[last6]}")
                 return last6
-        return ""
+
+        logging.debug(f"[DEBUG] No match found for {filename}")
+        return None
     
     def _start_scanner(self):
         self.scanner_thread = ScannerThread()

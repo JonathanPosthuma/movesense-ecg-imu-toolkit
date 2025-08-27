@@ -243,30 +243,32 @@ def processSBEM(file_path):
     #print("Unique chunk lengths encountered:", unique_chunk_lengths)
     return data_chunks
 
+# converter.py
 def convert_sbem(file_path: str, output_dir: str):
-    """
-    Convert an SBEM file to CSV.
-    :param file_path: Path to the input SBEM file.
-    :param output_dir: Folder where the converted CSV file will be saved.
-    """
     logging.info(f"Converting {file_path} to CSV in {output_dir}")
     rows = processSBEM(file_path)
-    if rows is None or len(rows) == 0:
-        logging.warning("No data rows parsed from SBEM file.")
-        return
+
+    if not rows:  # None or []
+        logging.warning(f"No data rows parsed from SBEM file: {file_path}")
+        return None  # <-- DO NOT write a stub; signal 'skip'
+
     try:
         df = pd.json_normalize(rows)
     except Exception as e:
-        logging.error("Error creating DataFrame: " + str(e))
-        return
+        logging.error(f"Error creating DataFrame for {file_path}: {e}")
+        return None
+
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     os.makedirs(output_dir, exist_ok=True)
     csv_filename = os.path.join(output_dir, base_name + ".csv")
+
     try:
         df.to_csv(csv_filename, index=False)
         logging.info(f"Saved CSV: {csv_filename}")
+        return csv_filename                 # <-- critical
     except Exception as e:
-        logging.error("Error saving CSV: " + str(e))
+        logging.error(f"Error saving CSV for {file_path}: {e}")
+        return None
 
 if __name__ == "__main__":
     import argparse

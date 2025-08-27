@@ -1,12 +1,19 @@
-.venv/
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-pc-extractor-parser/dist/
+# Virtual env
+.venv/
+
+# Build artifacts
 pc-extractor-parser/build/
+pc-extractor-parser/dist/
+
+# Data output
+pc-extractor-parser/DATA/
+
+# macOS cruft
 .DS_Store
-.vscode/
-.idea/
-pc-extractor-parser/logs/
-*.sbem
-pc-extractor-parser/logs/
+

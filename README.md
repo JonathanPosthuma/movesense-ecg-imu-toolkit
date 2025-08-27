@@ -13,7 +13,7 @@ For non-technical users, you can ship a one-click macOS app; for developers, you
 - **Dynamic sensor list:** Load a CSV mapping of `sensor_last6,participantID` to drive the grid and file naming.
 - **Batch extraction:** Extract from multiple sensors in one go; conversion runs automatically after extraction.
 - **Consistent file naming:** Output CSVs named `ParticipantID_DDMMYY_day.csv` (e.g., `3VSAN2PR_040625_3.csv`).
-- **Built-in conversion:** Parses SBEM logs (ECG mV packets & new IMU6 format) into tidy CSV.
+- **Built-in conversion:** Parses SBEM logs (ECG mV packets & IMU6 format) into tidy CSV.
 - **Sensor software included:** Repo also contains the Movesense sensor-side software you use.
 
 ## Requirements

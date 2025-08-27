@@ -426,10 +426,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                     s, p = row[0].strip(), row[1].strip()
                     s_digits = re.sub(r"\D", "", s)
-                    if len(s_digits) >= 6 and p:
-                        key = s_digits[-6:]
-                        if key not in mapping:
-                            order.append(key)
+                    if p and s_digits:
+                        key = s_digits[-6:].zfill(6)  # always force 6 digits
+                        mapping[key] = p
+                    if key not in mapping:
+                        order.append(key)
                         mapping[key] = p
             if mapping:
                 self.sensor_map = mapping
