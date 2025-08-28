@@ -1,18 +1,33 @@
-import os
-import glob
+import sys, os  
 import logging
+import glob
 import asyncio
 import threading
-from PyQt5 import QtWidgets, QtCore, QtGui
 import random
 import csv
 import re
 from datetime import datetime
+from PyQt5 import QtWidgets, QtCore, QtGui
+from concurrent.futures import ThreadPoolExecutor
+
+if sys.platform.startswith("win"):
+    try:
+        from platform_support import windows as plat_win
+        plat_win.init()
+    except Exception:
+        # stay silent if platform module is missing in dev
+        pass
+
+def resource_path(relpath: str) -> str:
+    """Get absolute path to resource, works in dev and PyInstaller bundle."""
+    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base, relpath)
 
 # Import SENSOR_LIST and the asynchronous extraction function.
 from extraction.extractor import extract_sensor, send_stop_logging
 # Import the conversion function.
 import conversion.converter as conv
+
 
 # --- ScannerThread definition (self-contained) ---
 from bleak import discover, BleakClient
@@ -50,6 +65,7 @@ class ScannerThread(QtCore.QThread):
         self._running = False
 
 from concurrent.futures import ThreadPoolExecutor
+
 
 # --- FlagHandler remains unchanged ---
 class FlagHandler(logging.Handler):
@@ -241,7 +257,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         # Set the application icon
-        self.setWindowIcon(QtGui.QIcon("icons/my_icon.png"))
+        if sys.platform.startswith("win"):
+            icon_file = resource_path("icons/app.ico")
+        elif sys.platform == "darwin":
+            icon_file = resource_path("icons/app.icns")
+        else:
+            icon_file = resource_path("icons/my_icon.png")  # fallback (Linux/dev)
+        self.setWindowIcon(QtGui.QIcon(icon_file))
         self.setWindowTitle("Movesense Data Tool")
         self.setGeometry(100, 100, 800, 600)
         self.found_sensor_ids = []

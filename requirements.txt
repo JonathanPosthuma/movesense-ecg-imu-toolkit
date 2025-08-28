@@ -1,6 +1,4 @@
-PyQt5-Qt5==5.15.16
-PyQt5==5.15.11
-PyQt5_sip==12.17.0
+PyQt5>=5.15,<6
 Pygments==2.19.1
 altgraph==0.17.4
 asttokens==3.0.0
@@ -27,24 +25,25 @@ packaging==24.2
 pandas==2.2.3
 parso==0.8.4
 pefile==2024.8.26
-pexpect==4.9.0
+pexpect==4.9.0; platform_system != "Windows"
 pillow==11.1.0
 platformdirs==4.3.6
 prompt_toolkit==3.0.50
 psutil==7.0.0
-ptyprocess==0.7.0
+ptyprocess==0.7.0; platform_system != "Windows"
 pure_eval==0.2.3
-pyQT5
 pyinstaller-hooks-contrib==2024.8
 pyinstaller==6.10.0
-pyobjc-core==10.3.2
-pyobjc-framework-Cocoa==10.3.2
-pyobjc-framework-CoreBluetooth==10.3.2
-pyobjc-framework-libdispatch==10.3.2
+# --- macOS only ---
+pyobjc-core==10.3.2; platform_system == "Darwin"
+pyobjc-framework-Cocoa==10.3.2; platform_system == "Darwin"
+pyobjc-framework-CoreBluetooth==10.3.2; platform_system == "Darwin"
+pyobjc-framework-libdispatch==10.3.2; platform_system == "Darwin"
+# -------------------
 pyparsing==3.2.1
 python-dateutil==2.9.0.post0
 pytz==2025.1
-pywin32-ctypes==0.2.3
+pywin32-ctypes==0.2.3; platform_system == "Windows"
 pyzmq==26.2.1
 scipy==1.15.2
 setuptools==74.0.0

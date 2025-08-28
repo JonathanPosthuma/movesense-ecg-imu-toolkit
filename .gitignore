@@ -1,19 +1,27 @@
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
-# Virtual env
+# Virtual envs
 .venv/
+.venv311/
+
+# OS cruft
+.DS_Store
+Thumbs.db
 
 # Build artifacts
-pc-extractor-parser/build/
+/build/
+dist/
+*.spec
+
+# App logs & large data
+*.log
+*.sbem
+*.csv
 pc-extractor-parser/dist/
+pc-extractor-parser/build/
 
-# Data output
-pc-extractor-parser/DATA/
-
-# macOS cruft
-.DS_Store
-**/.DS_Store
+# Local config
+pc-extractor-parser/config/settings.json
