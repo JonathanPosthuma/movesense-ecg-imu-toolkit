@@ -16,5 +16,4 @@ pc-extractor-parser/DATA/
 
 # macOS cruft
 .DS_Store
-
-pc-extractor-parser/logs/
+**/.DS_Store
