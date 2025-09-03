@@ -25,6 +25,7 @@ def resource_path(relpath: str) -> str:
 
 # Import SENSOR_LIST and the asynchronous extraction function.
 from extraction.extractor import extract_sensor, send_stop_logging
+
 # Import the conversion function.
 import conversion.converter as conv
 
@@ -91,7 +92,6 @@ class ExtractionThread(QtCore.QThread):
         self.conv_folder = conv_folder
         self.found_sensor_ids = found_sensor_ids  
 
-
         self.completed = [False] * len(self.sensor_list)
         self.busy = set()
         self.selection_lock = asyncio.Lock()
@@ -102,15 +102,22 @@ class ExtractionThread(QtCore.QThread):
         # NEW: mapping and day inputs
         self.sensor_map = sensor_map or {}
         self.day_number = day_number or 1
+        # NEW: global conversion lock for serialization
+        self.convert_lock = asyncio.Lock()
 
-    def build_target_name(self, sensor_last6):
+    def build_target_stem(self, sensor_last6):
+        """Return base filename without extension, e.g., PID_040625_3"""
         pid = self.sensor_map.get(sensor_last6)
         if not pid:
             logging.debug(f"[target] no pid for last6={sensor_last6}")
             return ""
         date_str = datetime.now().strftime("%d%m%y")
         day_str = str(self.day_number or 1)
-        target = f"{pid}_{date_str}_{day_str}.csv"
+        return f"{pid}_{date_str}_{day_str}"
+
+    def build_target_name(self, sensor_last6):
+        stem = self.build_target_stem(sensor_last6)
+        target = f"{stem}.csv" if stem else ""
         logging.debug(f"[target] {sensor_last6} -> {target}")
         return target
 
@@ -206,33 +213,46 @@ class ExtractionThread(QtCore.QThread):
                         logging.info(f"Extraction failed for sensor {sensor_id}")
 
                 if sensor_extracted:
-                    pattern = os.path.join(self.raw_folder, f"*{sensor_id}_*.sbem")
+                    pattern = os.path.join(self.raw_folder, f"*{sensor_id}*.sbem")
                     matching_files = glob.glob(pattern)
                     if matching_files:
                         for file_path in matching_files:
                             logging.info(f"Converting file {file_path} for sensor {sensor_id}...")
-                            try:
-                                csv_path = await loop.run_in_executor(executor, conv.convert_sbem, file_path, self.conv_folder)
-                                logging.debug(f"[convert] converter returned: {csv_path} for {file_path}")
+                            # Ensure only one conversion happens at a time across all workers
+                            async with self.convert_lock:
+                                try:
+                                    csv_path = await loop.run_in_executor(executor, conv.convert_sbem, file_path, self.conv_folder)
+                                    logging.debug(f"[convert] converter returned: {csv_path} for {file_path}")
 
-                                if not csv_path or not os.path.exists(csv_path):
-                                    logging.warning(f"[skip] No CSV produced for {file_path}; skipping rename.")
-                                    # proceed to next extracted file without failing the sensor run
-                                    continue
+                                    if not csv_path or not os.path.exists(csv_path):
+                                        logging.warning(f"[skip] No CSV produced for {file_path}; skipping rename.")
+                                        # proceed to next extracted file without failing the sensor run
+                                        continue
 
-                                # Use the known last6 sensor_id from this extraction
-                                target_name = self.build_target_name(sensor_id)
-                                logging.debug(f"[rename] target_name={target_name} for sensor_id={sensor_id}")
-                                if not target_name:
-                                    logging.info(f"[keep] No mapping for {sensor_id}; keeping {csv_path}")
-                                    continue
+                                    # Use the known last6 sensor_id from this extraction
+                                    target_name = self.build_target_name(sensor_id)
+                                    logging.debug(f"[rename] target_name={target_name} for sensor_id={sensor_id}")
+                                    if not target_name:
+                                        logging.info(f"[keep] No mapping for {sensor_id}; keeping {csv_path}")
+                                    else:
+                                        target_path = os.path.join(self.conv_folder, target_name)
+                                        logging.debug(f"[rename] {csv_path} -> {target_path}")
+                                        final_path = self._safe_rename(csv_path, target_path)
+                                        logging.info(f"[ok] Converted and renamed CSV to {final_path}")
 
-                                target_path = os.path.join(self.conv_folder, target_name)
-                                logging.debug(f"[rename] {csv_path} -> {target_path}")
-                                final_path = self._safe_rename(csv_path, target_path)
-                                logging.info(f"[ok] Converted and renamed to {final_path}")
-                            except Exception as e:
-                                logging.error(f"Conversion failed for {file_path}: {e}")
+                                    # --- NEW: also rename the SBEM in the raw folder to the same stem ---
+                                    target_stem = self.build_target_stem(sensor_id)
+                                    if target_stem:
+                                        sbem_target = os.path.join(self.raw_folder, f"{target_stem}.sbem")
+                                        try:
+                                            final_sbem = self._safe_rename(file_path, sbem_target)
+                                            logging.info(f"[ok] Raw SBEM renamed to {final_sbem}")
+                                        except Exception as e:
+                                            logging.error(f"[rename] Failed to rename SBEM {file_path} → {sbem_target}: {e}")
+                                    else:
+                                        logging.info(f"[keep] No mapping for {sensor_id}; keeping SBEM name {file_path}")
+                                except Exception as e:
+                                    logging.error(f"Conversion failed for {file_path}: {e}")
                     else:
                         logging.info(f"No extracted log files found for sensor {sensor_id}.")
 
@@ -487,15 +507,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.day_number = day
         return ok
 
-    def build_target_name(self, sensor_last6: str) -> str:
-        """Return desired CSV filename using mapping and current date. Example: PID_040625_3.csv"""
+    def build_target_stem(self, sensor_last6: str) -> str:
+        """Return desired base filename without extension, e.g., PID_040625_3"""
         pid = self.sensor_map.get(sensor_last6)
         if not pid:
             logging.debug(f"[target] no pid for last6={sensor_last6}")
             return ""
         date_str = datetime.now().strftime("%d%m%y")  # European DDMMYY
         day_str = str(self.day_number or 1)
-        target = f"{pid}_{date_str}_{day_str}.csv"
+        return f"{pid}_{date_str}_{day_str}"
+
+    def build_target_name(self, sensor_last6: str) -> str:
+        """Return desired CSV filename using mapping and current date. Example: PID_040625_3.csv"""
+        stem = self.build_target_stem(sensor_last6)
+        target = f"{stem}.csv" if stem else ""
         logging.debug(f"[target] {sensor_last6} -> {target}")
         return target
 
@@ -691,6 +716,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                     self.log_message(f"Converted and renamed to {final_path}")
                                 else:
                                     self.log_message(f"Converted (no mapping for {sensor_last6}); kept {csv_path}")
+                            # --- NEW: rename the original SBEM in place to the same stem ---
+                            if sensor_last6:
+                                target_stem = self.build_target_stem(sensor_last6)
+                                if target_stem:
+                                    sbem_target = os.path.join(folder, f"{target_stem}.sbem")
+                                    try:
+                                        final_sbem = self.safe_rename(file_path, sbem_target)
+                                        self.log_message(f"Raw SBEM renamed to {final_sbem}")
+                                    except Exception as e:
+                                        self.log_message(f"Failed to rename SBEM {file_path} → {sbem_target}: {e}")
                             converted_count += 1
                         else:
                             self.log_message(f"Conversion failed to produce CSV for {file_path}")
