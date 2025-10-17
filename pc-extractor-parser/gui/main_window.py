@@ -6,9 +6,20 @@ import threading
 import random
 import csv
 import re
+import json
 from datetime import datetime
+
+from matplotlib.pylab import tile
 from PyQt5 import QtWidgets, QtCore, QtGui
-from concurrent.futures import ThreadPoolExecutor
+from PyQt5.QtCore import Qt
+MIME_MOVESENSE = "application/x-movesense"
+
+# Optional plotting (falls back gracefully if not installed yet)
+try:
+    import pyqtgraph as pg
+    HAVE_PG = True
+except Exception:
+    HAVE_PG = False
 
 if sys.platform.startswith("win"):
     try:
@@ -65,8 +76,153 @@ class ScannerThread(QtCore.QThread):
     def stop(self):
         self._running = False
 
-from concurrent.futures import ThreadPoolExecutor
 
+
+class DiscoveredList(QtWidgets.QListWidget):
+    """QListWidget that supports dragging a Movesense device item with custom MIME payload."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if not item:
+            return
+        data = item.data(Qt.UserRole) or {}
+        payload = json.dumps({
+            "name": data.get("name", item.text()),
+            "address": data.get("address", ""),
+            "last6": data.get("last6", "")
+        }).encode("utf-8")
+        mime = QtCore.QMimeData()
+        mime.setData(MIME_MOVESENSE, payload)
+
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec_(Qt.MoveAction)
+
+class SensorTile(QtWidgets.QWidget):
+    sensorDropped = QtCore.pyqtSignal(str, str, int)  # last6, address, tile_index
+    """One tile: participant name, info line, and an ECG plot area."""
+    def __init__(self, sensor_last6: str, participant_name: str = "", parent=None, tile_index: int = -1):
+        super().__init__(parent)
+        self.sensor_last6 = sensor_last6
+        self.participant_name = participant_name or sensor_last6
+        self.tile_index = tile_index
+        self.assigned_last6 = None  # None = empty placeholder
+        self.setAcceptDrops(True)
+
+        self.setMinimumHeight(140)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        # Top: big participant label
+        self.name_label = QtWidgets.QLabel(self.participant_name)
+        font = self.name_label.font()
+        font.setPointSize(font.pointSize() + 2)
+        font.setBold(True)
+        self.name_label.setFont(font)
+        self.name_label.setAlignment(Qt.AlignCenter)
+        outer.addWidget(self.name_label)
+
+        # Info line: sensor id & placeholders for Batt/RSSI/Drops
+        self.info_label = QtWidgets.QLabel(f"Sensor {self.sensor_last6} · ECG 125 Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setStyleSheet("color: #555;")
+        outer.addWidget(self.info_label)
+
+        # Start as empty placeholder until assigned via DnD
+        self.set_placeholder(True)
+
+        # Plot area (or a placeholder frame if pyqtgraph missing)
+        if HAVE_PG:
+            self.plot = pg.PlotWidget()
+            self.plot.setBackground(None)
+            self.curve = self.plot.plot([])
+            self.plot.setMenuEnabled(False)
+            self.plot.hideButtons()
+            self.plot.setMouseEnabled(x=False, y=False)
+            self.plot.showGrid(x=False, y=False)
+            outer.addWidget(self.plot, 1)
+        else:
+            placeholder = QtWidgets.QFrame()
+            placeholder.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            placeholder.setStyleSheet("background: #f4f4f4; border: 1px solid #ddd;")
+            outer.addWidget(placeholder, 1)
+
+    def set_participant_name(self, name: str):
+        self.participant_name = name or self.sensor_last6
+        self.name_label.setText(self.participant_name)
+
+    def set_info(self, batt: str = "--", rssi: str = "--", drops: str = "0.0"):
+        self.info_label.setText(
+            f"Sensor {self.sensor_last6} · ECG 125 Hz · Batt {batt}% · RSSI {rssi} dBm · Drops {drops}%"
+        )
+
+    # For later: fast update of ECG trace
+    def set_trace(self, y):
+        if HAVE_PG:
+            self.curve.setData(y)
+
+    def set_placeholder(self, is_placeholder: bool):
+        """Switch visual between empty placeholder and active tile."""
+        if is_placeholder:
+            self.assigned_last6 = None
+            self.name_label.setText("Drop sensor here")
+            self.name_label.setStyleSheet("color:#777;")
+            self.info_label.setText("No sensor assigned")
+        else:
+            self.name_label.setStyleSheet("")
+
+    def assign_sensor(self, last6: str, display_name: str):
+        self.assigned_last6 = last6
+        self.set_placeholder(False)
+        self.participant_name = display_name or last6
+        self.name_label.setText(self.participant_name)
+        self.info_label.setText(f"Sensor {last6} · ECG -- Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
+
+    # --- Drag & Drop handlers ---
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        if event.mimeData().hasFormat(MIME_MOVESENSE):
+            event.acceptProposedAction()
+            self.setStyleSheet("border: 2px dashed #4a90e2;")
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
+        if event.mimeData().hasFormat(MIME_MOVESENSE):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent):
+        self.setStyleSheet("")
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        self.setStyleSheet("")
+        if not event.mimeData().hasFormat(MIME_MOVESENSE):
+            event.ignore()
+            return
+        try:
+            data = json.loads(bytes(event.mimeData().data(MIME_MOVESENSE)).decode("utf-8"))
+            last6 = (data.get("last6") or "").strip()
+            address = data.get("address", "")
+            if not last6:
+                name = data.get("name", "")
+                m = re.findall(r"(\d{6,})", name)
+                if m:
+                    last6 = m[-1][-6:]
+            if not last6:
+                QtWidgets.QToolTip.showText(event.pos(), "Not a Movesense sensor", self)
+                event.ignore()
+                return
+            self.sensorDropped.emit(last6, address, self.tile_index)
+            event.acceptProposedAction()
+        except Exception:
+            event.ignore()
 
 # --- FlagHandler remains unchanged ---
 class FlagHandler(logging.Handler):
@@ -290,6 +446,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sensor_map = {}
         self.day_number = None
         self.sensor_list = []  # dynamic list from CSV (last 6 digits)
+        # DnD selection state
+        self.selected_slots = {}  # tile_index -> last6
+        self.last6_to_tile = {}   # last6 -> tile_index
         self._setup_ui()
         self._create_menu()  # Create menu including About
         self._start_scanner()
@@ -298,46 +457,72 @@ class MainWindow(QtWidgets.QMainWindow):
         # Timers will be created dynamically after loading CSV
 
     def _setup_ui(self):
+        # Central widget with a horizontal splitter
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QtWidgets.QVBoxLayout(central_widget)
-        
-        # --- Bluetooth Device List Section ---
-        self.device_list = QtWidgets.QListWidget()
-        main_layout.addWidget(QtWidgets.QLabel("Discovered Movesense Devices:"))
-        main_layout.addWidget(self.device_list)
-        
-        # --- Sensor List Section (dynamic grid based on loaded CSV) ---
+        root = QtWidgets.QHBoxLayout(central_widget)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter)
+
+        # ---------------- Left panel (existing extractor UI) ----------------
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(6, 6, 6, 6)
+        left_layout.setSpacing(6)
+
+        # --- Discovered Sensors (live) ---
+        discovered_label = QtWidgets.QLabel("Discovered Sensors (live):")
+        discovered_label.setStyleSheet("color:#333;")
+        self.discovered_list = DiscoveredList()
+        self.discovered_list.setUniformItemSizes(True)
+
+        left_layout.addWidget(discovered_label)
+        left_layout.addWidget(self.discovered_list)
+
+        # --- Sensor Extraction Status (1 sensor per row, small font) ---
         num_sensors = len(self.sensor_list)
-        rows = (num_sensors + 1) // 2 if num_sensors else 0
-        columns = 4  # 2 sensors per row, each sensor uses 2 columns (name, status)
-        self.sensor_table = QtWidgets.QTableWidget(rows, columns)
+        self.sensor_table = QtWidgets.QTableWidget(num_sensors, 2)
         self.sensor_table.horizontalHeader().setVisible(False)
         self.sensor_table.verticalHeader().setVisible(False)
+        self.sensor_table.setAlternatingRowColors(True)
+
+        small_font = self.font()
+        small_font.setPointSize(max(8, small_font.pointSize() - 2))
+        self.sensor_table.setFont(small_font)
+
         self.sensor_entries = []
         for i, sensor_name in enumerate(self.sensor_list):
-            row = i // 2
-            col_offset = (i % 2) * 2
             display_name = sensor_name
             if self.sensor_map.get(sensor_name):
                 display_name = f"{sensor_name} ({self.sensor_map[sensor_name]})"
             name_item = QtWidgets.QTableWidgetItem(display_name)
             status_item = QtWidgets.QTableWidgetItem("Pending")
-            name_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            name_item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             status_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.sensor_table.setItem(row, col_offset, name_item)
-            self.sensor_table.setItem(row, col_offset + 1, status_item)
+            self.sensor_table.setItem(i, 0, name_item)
+            self.sensor_table.setItem(i, 1, status_item)
             self.sensor_entries.append((name_item, status_item))
-        # Widen columns so sensor + participant text fits
+
         header = self.sensor_table.horizontalHeader()
-        header.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
-        self.sensor_table.setColumnWidth(0, 290)  # name (left)
-        self.sensor_table.setColumnWidth(1, 110)  # status (left)
-        self.sensor_table.setColumnWidth(2, 290)  # name (right)
-        self.sensor_table.setColumnWidth(3, 110)  # status (right)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        self.sensor_table.setColumnWidth(1, 90)
         self.sensor_table.setWordWrap(False)
-        main_layout.addWidget(QtWidgets.QLabel("Sensor Extraction Status:"))
-        main_layout.addWidget(self.sensor_table)
+        # Compact rows and ensure full height for all sensors
+        vh = self.sensor_table.verticalHeader()
+        vh.setDefaultSectionSize(20)
+        self.sensor_table.setMinimumHeight(
+            vh.defaultSectionSize() * max(1, num_sensors)
+            + self.sensor_table.horizontalHeader().height()
+            + 6
+        )
+
+        left_layout.addWidget(QtWidgets.QLabel("Sensor Extraction Status:"))
+        left_layout.addWidget(self.sensor_table)
 
         # --- Control Buttons Section ---
         button_layout = QtWidgets.QHBoxLayout()
@@ -347,18 +532,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.convert_button = QtWidgets.QPushButton("Convert Data")
         self.convert_button.clicked.connect(self.on_convert)
         button_layout.addWidget(self.convert_button)
-        main_layout.addLayout(button_layout)
-        
-        # --- MODE Toggle Button Section (for future expansion) ---
+        left_layout.addLayout(button_layout)
+
+        # --- MODE Toggle Button Section ---
         mode_layout = QtWidgets.QHBoxLayout()
         self.mode_toggle = QtWidgets.QPushButton("Mode: Extract")
         self.mode_toggle.setCheckable(True)
         self.mode_toggle.clicked.connect(self.toggle_mode)
         mode_layout.addWidget(self.mode_toggle)
-        main_layout.addLayout(mode_layout)
-        self.mode = "Extract"  # default mode
-        
-        # --- Settings Section with Folder Browsing ---
+        left_layout.addLayout(mode_layout)
+        self.mode = "Extract"
+
+        # --- Settings: folders & mapping ---
         raw_layout = QtWidgets.QHBoxLayout()
         self.raw_output_edit = QtWidgets.QLineEdit()
         self.raw_output_edit.setPlaceholderText("Raw logs output folder")
@@ -366,7 +551,8 @@ class MainWindow(QtWidgets.QMainWindow):
         raw_browse_button.clicked.connect(self.select_raw_folder)
         raw_layout.addWidget(self.raw_output_edit)
         raw_layout.addWidget(raw_browse_button)
-        main_layout.addLayout(raw_layout)
+        left_layout.addLayout(raw_layout)
+
         csv_layout = QtWidgets.QHBoxLayout()
         self.csv_output_edit = QtWidgets.QLineEdit()
         self.csv_output_edit.setPlaceholderText("CSV output folder")
@@ -374,53 +560,137 @@ class MainWindow(QtWidgets.QMainWindow):
         csv_browse_button.clicked.connect(self.select_csv_folder)
         csv_layout.addWidget(self.csv_output_edit)
         csv_layout.addWidget(csv_browse_button)
-        main_layout.addLayout(csv_layout)
+        left_layout.addLayout(csv_layout)
 
-        # --- Mapping CSV Section ---
         mapping_layout = QtWidgets.QHBoxLayout()
         self.mapping_label = QtWidgets.QLabel("Mapping: not loaded")
         load_mapping_button = QtWidgets.QPushButton("Load Sensor→Participant CSV")
         load_mapping_button.clicked.connect(self.load_mapping_csv)
         mapping_layout.addWidget(self.mapping_label)
         mapping_layout.addWidget(load_mapping_button)
-        main_layout.addLayout(mapping_layout)
-                
+        left_layout.addLayout(mapping_layout)
+
         # --- Log/Status Output Area ---
         self.status_text = QtWidgets.QTextEdit()
         self.status_text.setReadOnly(True)
-        main_layout.addWidget(self.status_text)
-        
+        left_layout.addWidget(self.status_text)
+
+        splitter.addWidget(left)
+
+        # ---------------- Right panel (Live QA tiles) ----------------
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 6, 6, 6)
+        right_layout.setSpacing(6)
+
+        title = QtWidgets.QLabel("Live QA — ECG Preview")
+        tfont = title.font(); tfont.setBold(True)
+        title.setFont(tfont)
+        sfont = title.font()
+        sfont.setPointSize(max(9, sfont.pointSize()))
+        title.setFont(sfont)
+        title.setAlignment(Qt.AlignCenter)
+        right_layout.addWidget(title)
+
+        self.qa_grid = QtWidgets.QGridLayout()
+        self.qa_grid.setSpacing(6)
+        right_layout.addLayout(self.qa_grid, 1)
+
+        # Build tiles now (will refresh when mapping loads)
+        self.tiles = {}  # last6 -> SensorTile
+        self.rebuild_qa_tiles()
+
+        splitter.addWidget(right)
+
+        # Give left more width for tables; right will hold 4×4 plots
+        splitter.setSizes([int(self.width() * 0.62), int(self.width() * 0.38)])
+    def on_sensor_dropped(self, last6: str, address: str, tile_index: int):
+        """Handle a sensor being dropped onto a tile: assign or swap as needed."""
+        # Find the target tile widget by index
+        target_tile = None
+        for t in self.tiles.values():
+            if t.tile_index == tile_index:
+                target_tile = t
+                break
+        if target_tile is None:
+            return
+
+        display_name = self.sensor_map.get(last6, last6)
+
+        # If tile occupied by another sensor, handle swap/move
+        current_on_target = self.selected_slots.get(tile_index)
+        old_tile = self.last6_to_tile.get(last6)
+
+        if current_on_target and current_on_target != last6:
+            if old_tile is not None:
+                # swap: move existing target sensor to old_tile
+                self.selected_slots[old_tile] = current_on_target
+                self.last6_to_tile[current_on_target] = old_tile
+                # update old_tile UI
+                for tile in self.tiles.values():
+                    if tile.tile_index == old_tile:
+                        tile.assign_sensor(current_on_target, self.sensor_map.get(current_on_target, current_on_target))
+                        break
+            else:
+                # unassign existing sensor on target
+                self.last6_to_tile.pop(current_on_target, None)
+
+        # Assign dropped sensor to target tile
+        self.selected_slots[tile_index] = last6
+        self.last6_to_tile[last6] = tile_index
+        target_tile.assign_sensor(last6, display_name)
+        # (Streaming/subscription logic will be added later.)
+
+    def clear_tile_assignment(self, tile_index: int):
+        """Unassign a tile (placeholder only)."""
+        last6 = self.selected_slots.pop(tile_index, None)
+        if last6:
+            self.last6_to_tile.pop(last6, None)
+        for t in self.tiles.values():
+            if t.tile_index == tile_index:
+                t.set_placeholder(True)
+                break
     def rebuild_sensor_table(self):
         # Rebuild the table and timers using self.sensor_list and self.sensor_map
         num_sensors = len(self.sensor_list)
-        rows = (num_sensors + 1) // 2 if num_sensors else 0
         self.sensor_table.clear()
-        self.sensor_table.setRowCount(rows)
-        self.sensor_table.setColumnCount(4)
+        self.sensor_table.setRowCount(num_sensors)
+        self.sensor_table.setColumnCount(2)
         self.sensor_table.horizontalHeader().setVisible(False)
         self.sensor_table.verticalHeader().setVisible(False)
-        # Widen columns so sensor + participant text fits (again after rebuild)
+        self.sensor_table.setAlternatingRowColors(True)
+
+        small_font = self.font()
+        small_font.setPointSize(max(8, small_font.pointSize() - 2))
+        self.sensor_table.setFont(small_font)
+
         header = self.sensor_table.horizontalHeader()
-        header.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
-        self.sensor_table.setColumnWidth(0, 290)
-        self.sensor_table.setColumnWidth(1, 110)
-        self.sensor_table.setColumnWidth(2, 290)
-        self.sensor_table.setColumnWidth(3, 110)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        self.sensor_table.setColumnWidth(1, 90)
         self.sensor_table.setWordWrap(False)
+        # Ensure table shows all rows without scroll for up to 16 sensors
+        vh = self.sensor_table.verticalHeader()
+        vh.setDefaultSectionSize(20)
+        self.sensor_table.setMinimumHeight(
+            vh.defaultSectionSize() * max(1, num_sensors)
+            + self.sensor_table.horizontalHeader().height()
+            + 6
+        )
+
         self.sensor_entries = []
         for i, sensor_name in enumerate(self.sensor_list):
-            row = i // 2
-            col_offset = (i % 2) * 2
             display_name = sensor_name
             if self.sensor_map.get(sensor_name):
                 display_name = f"{sensor_name} ({self.sensor_map[sensor_name]})"
             name_item = QtWidgets.QTableWidgetItem(display_name)
             status_item = QtWidgets.QTableWidgetItem("Pending")
-            name_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            name_item.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
             status_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.sensor_table.setItem(row, col_offset, name_item)
-            self.sensor_table.setItem(row, col_offset + 1, status_item)
+            self.sensor_table.setItem(i, 0, name_item)
+            self.sensor_table.setItem(i, 1, status_item)
             self.sensor_entries.append((name_item, status_item))
+
         # Recreate timers to match the new sensor list
         self.found_timers = {}
         for i in range(len(self.sensor_list)):
@@ -428,8 +698,38 @@ class MainWindow(QtWidgets.QMainWindow):
             timer.setSingleShot(True)
             timer.timeout.connect(lambda idx=i: self.handle_found_timeout(idx))
             self.found_timers[i] = timer
+        self.rebuild_qa_tiles()
         self.log_message(f"Sensor table rebuilt with {num_sensors} sensors.")
-    
+
+    def rebuild_qa_tiles(self):
+        """Build or refresh the 4x4 grid of SensorTile widgets with participant names."""
+        # Clear current grid
+        if hasattr(self, "qa_grid"):
+            while self.qa_grid.count():
+                item = self.qa_grid.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+
+        if not hasattr(self, "tiles"):
+            self.tiles = {}
+        else:
+            self.tiles.clear()
+
+        if not self.sensor_list:
+            return
+
+        cols = 4  # fixed 4 columns; shows up to 16 sensors nicely
+        for idx, last6 in enumerate(self.sensor_list[:16]):
+            row = idx // cols
+            col = idx % cols
+            pname = self.sensor_map.get(last6, last6)
+            tile = SensorTile(sensor_last6=last6, participant_name=pname, parent=self, tile_index=idx)
+            tile.sensorDropped.connect(self.on_sensor_dropped)
+            tile.set_placeholder(True)
+            self.qa_grid.addWidget(tile, row, col)
+            self.tiles[last6] = tile
+
     def toggle_mode(self):
         # (Mode toggle retained for potential future behavior changes.)
         if self.mode_toggle.isChecked():
@@ -440,26 +740,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mode = "Extract"
             self.mode_toggle.setText("Mode: Extract")
             self.log_message("Switched to Extract mode.")
-    
+
     def _create_menu(self):
         menubar = self.menuBar()
         help_menu = menubar.addMenu("Help")
         about_action = QtWidgets.QAction("About", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
-    
+
     def show_about(self):
         about_text = ("Movesense Data Tool\n\n"
                       "Software signed by Jonathan Posthuma\n"
                       "Radboud University")
         QtWidgets.QMessageBox.about(self, "About", about_text)
-    
+
     def select_raw_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Raw Logs Output Folder")
         if folder:
             self.raw_output_edit.setText(folder)
             self.log_message(f"Selected raw logs output folder: {folder}")
-    
+
     def select_csv_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select CSV Output Folder")
         if folder:
@@ -479,7 +779,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 for row in rdr:
                     if not row or len(row) < 2:
                         continue
-                    s, p = row[0].strip(), row[1].strip()
+                    s = row[0].strip()
+                    # Prefer 3rd column as NAME; fallback to 2nd if 3rd missing or empty
+                    p = row[2].strip() if len(row) >= 3 and row[2].strip() else row[1].strip()
                     s_digits = re.sub(r"\D", "", s)
                     if len(s_digits) >= 6 and p:
                         key = s_digits[-6:]
@@ -492,6 +794,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.mapping_label.setText(f"Mapping loaded: {len(mapping)} entries")
                 self.log_message(f"Loaded mapping CSV: {path} with {len(mapping)} entries")
                 self.rebuild_sensor_table()
+                self.rebuild_qa_tiles()
             else:
                 QtWidgets.QMessageBox.warning(
                     self, "Mapping CSV", "No valid 'sensor_last6,participantID' rows found.")
@@ -552,31 +855,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
         logging.debug(f"[DEBUG] No match found for {filename}")
         return None
-    
+
     def _start_scanner(self):
         self.scanner_thread = ScannerThread()
         self.scanner_thread.devicesFound.connect(self.update_device_list)
         self.scanner_thread.start()
         self.log_message("Started Bluetooth scanning...")
-    
+
     def update_device_list(self, devices):
-        self.device_list.clear()
-        # Clear the current list in-place
+        # Live discovered list
+        self.discovered_list.clear()
         self.found_sensor_ids.clear()
-        for device in devices:
-            item_text = f"{device.name} ({device.address})"
-            self.device_list.addItem(item_text)
-            if device.name and device.name.startswith("Movesense"):
-                parts = device.name.split(" ")
+
+        for d in devices:
+            name = d.name or "(unknown)"
+            addr = getattr(d, "address", "")
+
+            # Build list item with payload for DnD
+            item = QtWidgets.QListWidgetItem(f"{name} ({addr})")
+
+            last6_val = ""
+            if d.name and d.name.startswith("Movesense"):
+                parts = d.name.split(" ")
                 if len(parts) >= 2:
-                    full_id = parts[1].strip()  # e.g., "243330000071"
-                    sensor_id = full_id[-6:]     # e.g., "000071"
-                    self.found_sensor_ids.append(sensor_id)
-        self.log_message(f"Found {len(devices)} Movesense device(s): {self.found_sensor_ids}")
-        
-        # For each sensor, if it is found and is not in a blocked state,
-        # toggle it to display "Found" and restart its timeout.
+                    full_id = parts[1].strip()          # e.g., "243330000071"
+                    last6_val = full_id[-6:]            # -> "000071"
+                    self.found_sensor_ids.append(last6_val)
+
+            # Attach metadata for drag payload
+            item.setData(Qt.UserRole, {"name": name, "address": addr, "last6": last6_val})
+            self.discovered_list.addItem(item)
+
+        self.log_message(
+            f"Found {len(self.found_sensor_ids)} of {len(self.sensor_list) if self.sensor_list else 0} expected sensors: {self.found_sensor_ids}"
+        )
+
+        # Update table statuses/timers the same way
         for i, (name_item, status_item) in enumerate(self.sensor_entries):
+            if i >= len(self.sensor_list):
+                break
             sensor_id = self.sensor_list[i]
             if sensor_id in self.found_sensor_ids:
                 current_status = status_item.text().strip().lower()
@@ -739,11 +1056,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scanner_thread.wait()
         event.accept()
 
-def closeEvent(self, event):
-    if hasattr(self, "scanner_thread"):
-        self.scanner_thread.stop()
-        self.scanner_thread.wait()
-    event.accept()
 
 if __name__ == "__main__":
     import sys
