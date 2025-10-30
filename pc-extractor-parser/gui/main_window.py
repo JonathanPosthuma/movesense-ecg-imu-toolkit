@@ -7,19 +7,38 @@ import random
 import csv
 import re
 import json
+import struct
+from concurrent.futures import ThreadPoolExecutor
+from functools import reduce
+from collections import deque
+
 from datetime import datetime
 
-from matplotlib.pylab import tile
+# Optionally import numpy for fast array operations in plotting
+try:
+    import numpy as np
+    HAVE_NP = True
+except Exception:
+    HAVE_NP = False
+
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt
 MIME_MOVESENSE = "application/x-movesense"
+
+# Custom GATT UUIDs (sensor firmware)
+WRITE_CHARACTERISTIC_UUID = "34800001-7185-4d5d-b431-630e7050e8f0"
+NOTIFY_CHARACTERISTIC_UUID = "34800002-7185-4d5d-b431-630e7050e8f0"
+PACKET_TYPE_DATA = 2
+PACKET_TYPE_DATA_PART2 = 3
 
 # Optional plotting (falls back gracefully if not installed yet)
 try:
     import pyqtgraph as pg
     HAVE_PG = True
-except Exception:
+    logging.info("pyqtgraph detected: live plotting ENABLED")
+except Exception as e:
     HAVE_PG = False
+    logging.warning(f"pyqtgraph not available ({e}); live plotting DISABLED — install with: pip install pyqtgraph")
 
 if sys.platform.startswith("win"):
     try:
@@ -42,7 +61,7 @@ import conversion.converter as conv
 
 
 # --- ScannerThread definition (self-contained) ---
-from bleak import discover, BleakClient
+from bleak import discover, BleakClient, BleakScanner
 async def _reset_sensor(end_of_serial: str):
     """Discover and send STOP_LOGGING to the sensor matching end_of_serial."""
     devices = await discover()
@@ -76,7 +95,289 @@ class ScannerThread(QtCore.QThread):
     def stop(self):
         self._running = False
 
+# --- Minimal binary helpers (based on your sample) ---
+class DataView:
+    def __init__(self, array, bytes_per_element=1):
+        self.array = array
+        self.bytes_per_element = 1
+    def __get_binary(self, start_index, byte_count, signed=False):
+        integers = [self.array[start_index + x] for x in range(byte_count)]
+        _bytes = [integer.to_bytes(self.bytes_per_element, byteorder='little', signed=signed) for integer in integers]
+        return reduce(lambda a, b: a + b, _bytes)
+    def get_uint_16(self, start_index):
+        return int.from_bytes(self.__get_binary(start_index, 2), byteorder='little')
+    def get_uint_8(self, start_index):
+        return int.from_bytes(self.__get_binary(start_index, 1), byteorder='little')
+    def get_uint_32(self, start_index):
+        binary = self.__get_binary(start_index, 4)
+        return struct.unpack('<I', binary)[0]
+    def get_int_32(self, start_index):
+        binary = self.__get_binary(start_index, 4)
+        return struct.unpack('<i', binary)[0]
 
+class ECGSignals(QtCore.QObject):
+    status = QtCore.pyqtSignal(str, str)     # last6, message
+    subscribed = QtCore.pyqtSignal(str, int) # last6, sample_rate
+    samples = QtCore.pyqtSignal(str, int)    # last6, count_increment
+    ecg = QtCore.pyqtSignal(str, object)     # last6, list[float] (mV)
+
+class MovesenseECGSession(QtCore.QObject):
+    """One live ECG subscription session for a sensor (last6). Connects and subscribes at 200 Hz."""
+    def __init__(self, last6: str, parent=None, addr: str = ""):
+        super().__init__(parent)
+        self.last6 = last6
+        self.sample_rate = 200
+        self.signals = ECGSignals()
+        self._loop = None
+        self._thread = None
+        self._stop_event = None
+        self._client = None
+        self._addr = addr or None
+        self._pkt_counter = 0
+        self._first_dump_done = False
+        self._stopping = False
+        self._watchdog_task = None
+
+    # ---- lifecycle ----
+    def start(self):
+        if self._thread:
+            return
+        self._thread = QtCore.QThread()
+        self.moveToThread(self._thread)
+        self._thread.started.connect(self._run)
+        self._thread.start()
+
+    def stop(self):
+        if not self._thread:
+            return
+        self._stopping = True
+        # Try to force unsubscribe & disconnect immediately on the session loop
+        if self._loop:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._force_unsubscribe_disconnect(), self._loop)
+                try:
+                    fut.result(timeout=1.5)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        # Cancel watchdog if any
+        try:
+            if self._watchdog_task:
+                self._watchdog_task.cancel()
+        except Exception:
+            pass
+        # Finally signal the main stop event to unwind the thread
+        QtCore.QMetaObject.invokeMethod(self, "_request_stop", Qt.QueuedConnection)
+    async def _force_unsubscribe_disconnect(self):
+        try:
+            if self._client and self._client.is_connected:
+                # Send UNSUBSCRIBE for ref=100 (ECG)
+                try:
+                    await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([2, 100]), response=True)
+                except Exception:
+                    pass
+                # Stop notify
+                try:
+                    await self._client.stop_notify(NOTIFY_CHARACTERISTIC_UUID)
+                except Exception:
+                    pass
+                # Fully disconnect
+                try:
+                    await self._client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @QtCore.pyqtSlot()
+    def _run(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._stop_event = asyncio.Event()
+
+        async def runner():
+            try:
+                await self._connect_and_subscribe()
+                await self._stop_event.wait()
+            finally:
+                await self._cleanup()
+
+        try:
+            self._loop.run_until_complete(runner())
+        finally:
+            try:
+                self._loop.stop(); self._loop.close()
+            except Exception:
+                pass
+            self._thread.quit(); self._thread.wait()
+            self._thread = None
+            self._loop = None
+            self._stop_event = None
+
+    @QtCore.pyqtSlot()
+    def _request_stop(self):
+        if self._loop and self._stop_event and not self._stop_event.is_set():
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+
+    # ---- core ----
+    async def _connect_and_subscribe(self):
+        if not self._addr:
+            self._addr = await self._discover_addr(self.last6)
+        if not self._addr:
+            self.signals.status.emit(self.last6, f"Sensor ...{self.last6} not found")
+            return
+        self.signals.status.emit(self.last6, f"Connecting to {self._addr} …")
+        self._client = BleakClient(self._addr, disconnected_callback=self._on_disconnect)
+        try:
+            await self._client.__aenter__()
+            if not self._client.is_connected:
+                self.signals.status.emit(self.last6, "Failed to connect")
+                return
+            self.signals.status.emit(self.last6, "Connected; enabling notifications")
+            await self._client.start_notify(NOTIFY_CHARACTERISTIC_UUID, self._on_notify)
+
+            # Prefer RAW int32 ECG (matches our parser: timestamp + 16×int32) and fallback to /mV floats if needed.
+            ref = 100
+            path_raw = "/Meas/ECG/200"
+            path_mv = "/Meas/ECG/200/mV"
+
+            tried_mv = False
+            try:
+                payload_raw = bytearray([1, ref]) + bytearray(path_raw, "utf-8")
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload_raw, response=True)
+                self.signals.subscribed.emit(self.last6, 200)
+                self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path_raw}")
+            except Exception as e:
+                logging.info(f"[ECG {self.last6}] subscribe to {path_raw} failed: {e}")
+                tried_mv = True
+                try:
+                    payload_mv = bytearray([1, ref]) + bytearray(path_mv, "utf-8")
+                    await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload_mv, response=True)
+                    self.signals.subscribed.emit(self.last6, 200)
+                    self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path_mv}")
+                except Exception as e2:
+                    self.signals.status.emit(self.last6, f"Subscribe failed: {e2}")
+                    return
+
+            async def _notify_watchdog():
+                try:
+                    await asyncio.sleep(3)
+                    if self._pkt_counter == 0:
+                        self.signals.status.emit(self.last6, "No ECG packets yet – switching path")
+                        try:
+                            await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([2, ref]), response=True)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
+                        try:
+                            # toggle: if we tried RAW first, try /mV; else try RAW
+                            next_path = path_mv if not tried_mv else path_raw
+                            payload2 = bytearray([1, ref]) + bytearray(next_path, "utf-8")
+                            await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload2, response=True)
+                            self.signals.status.emit(self.last6, f"Retry subscribed {next_path}")
+                        except Exception as e3:
+                            self.signals.status.emit(self.last6, f"Fallback subscribe failed: {e3}")
+                except Exception:
+                    pass
+            if not self._stopping and (self._stop_event is None or not self._stop_event.is_set()):
+                self._watchdog_task = asyncio.create_task(_notify_watchdog())
+        except Exception as e:
+            logging.error(f"[ECG {self.last6}] setup error: {e}")
+            self.signals.status.emit(self.last6, f"Error: {e}")
+
+    async def _cleanup(self):
+        # Cancel watchdog
+        try:
+            if self._watchdog_task:
+                self._watchdog_task.cancel()
+                self._watchdog_task = None
+        except Exception:
+            pass
+        try:
+            if self._client and self._client.is_connected:
+                try:
+                    await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([2, 100]), response=True)
+                except Exception:
+                    pass
+                try:
+                    await self._client.stop_notify(NOTIFY_CHARACTERISTIC_UUID)
+                except Exception:
+                    pass
+            if self._client:
+                try:
+                    await self._client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+        finally:
+            self._client = None
+
+    def _on_disconnect(self, _client):
+        self._stopping = True
+        self.signals.status.emit(self.last6, "Disconnected")
+        if self._loop and self._stop_event and not self._stop_event.is_set():
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+
+    # ---- notifications ----
+    def _on_notify(self, _sender: int, data: bytearray):
+        try:
+            if self._stopping:
+                return
+            self._pkt_counter += 1
+            if not self._first_dump_done:
+                try:
+                    preview = " ".join(f"{b:02X}" for b in data[:16])
+                    logging.info(f"[ECG {self.last6}] first notify len={len(data)} bytes: {preview}")
+                except Exception:
+                    pass
+                self._first_dump_done = True
+            values = []
+            d = DataView(data)
+            parsed = False
+            # Attempt RAW format: [2,type_ref][4B timestamp][16×int32]
+            try:
+                base = 6
+                vals = [d.get_int_32(base + i*4) * 0.00038 for i in range(16)]  # mV (0.38 µV/LSB)
+                vmax = max(abs(v) for v in vals)
+                if vmax < 50_000:  # if we accidentally parsed floats as ints, this would explode
+                    values = vals
+                    parsed = True
+            except Exception:
+                parsed = False
+            # If RAW failed or looks insane, try float32 array (no timestamp): [2,type_ref][16×float32 mV]
+            if not parsed:
+                try:
+                    base = 2
+                    vals = [struct.unpack_from('<f', bytes(d.array), base + i*4)[0] for i in range(16)]
+                    values = vals
+                    parsed = True
+                except Exception:
+                    parsed = False
+            if not parsed:
+                self.signals.samples.emit(self.last6, 16)
+                return
+            self.signals.samples.emit(self.last6, 16)
+            self.signals.ecg.emit(self.last6, values)
+        except Exception as e:
+            logging.debug(f"[ECG {self.last6}] parse error: {e}")
+
+    # ---- helpers ----
+    async def _discover_addr(self, last6: str):
+        try:
+            devices = await BleakScanner.discover()
+        except Exception:
+            devices = await discover()
+        for d in devices:
+            name = (d.name or "").strip()
+            if not name:
+                continue
+            # Match last6 anywhere in the advertised name
+            if self.last6 in name:
+                return d.address
+            m = re.findall(r"(\d{6,})", name)
+            if m and m[-1][-6:] == last6:
+                return d.address
+        return None
 
 class DiscoveredList(QtWidgets.QListWidget):
     """QListWidget that supports dragging a Movesense device item with custom MIME payload."""
@@ -104,6 +405,8 @@ class DiscoveredList(QtWidgets.QListWidget):
 
 class SensorTile(QtWidgets.QWidget):
     sensorDropped = QtCore.pyqtSignal(str, str, int)  # last6, address, tile_index
+    stopRequested = QtCore.pyqtSignal(str, int)   # last6, tile_index
+    clearRequested = QtCore.pyqtSignal(str, int)  # last6, tile_index
     """One tile: participant name, info line, and an ECG plot area."""
     def __init__(self, sensor_last6: str, participant_name: str = "", parent=None, tile_index: int = -1):
         super().__init__(parent)
@@ -129,7 +432,7 @@ class SensorTile(QtWidgets.QWidget):
         outer.addWidget(self.name_label)
 
         # Info line: sensor id & placeholders for Batt/RSSI/Drops
-        self.info_label = QtWidgets.QLabel(f"Sensor {self.sensor_last6} · ECG 125 Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
+        self.info_label = QtWidgets.QLabel(f"Sensor {self.sensor_last6} · ECG 200 Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setStyleSheet("color: #555;")
         outer.addWidget(self.info_label)
@@ -140,17 +443,28 @@ class SensorTile(QtWidgets.QWidget):
         # Plot area (or a placeholder frame if pyqtgraph missing)
         if HAVE_PG:
             self.plot = pg.PlotWidget()
-            self.plot.setBackground(None)
-            self.curve = self.plot.plot([])
+            self.plot.setBackground('w')  # solid white to avoid transparent theme issues
+            self.plot.setDownsampling(auto=True, mode='peak')
+            self.plot.setClipToView(True)
+            self.plot.enableAutoRange('xy', True)
+            self.curve = self.plot.plot([], pen=pg.mkPen('k', width=1))  # black line
             self.plot.setMenuEnabled(False)
             self.plot.hideButtons()
             self.plot.setMouseEnabled(x=False, y=False)
-            self.plot.showGrid(x=False, y=False)
+            self.plot.showGrid(x=True, y=True, alpha=0.2)
+            # Fix y-axis range for ECG signal (mV)
+            self.plot.setYRange(-2, 2)
+            self.plot.disableAutoRange('y')
             outer.addWidget(self.plot, 1)
         else:
             placeholder = QtWidgets.QFrame()
             placeholder.setFrameShape(QtWidgets.QFrame.StyledPanel)
             placeholder.setStyleSheet("background: #f4f4f4; border: 1px solid #ddd;")
+            ph_layout = QtWidgets.QVBoxLayout(placeholder)
+            msg = QtWidgets.QLabel("Live plot disabled — install pyqtgraph:\n`pip install pyqtgraph`")
+            msg.setAlignment(Qt.AlignCenter)
+            msg.setStyleSheet("color:#666;")
+            ph_layout.addWidget(msg)
             outer.addWidget(placeholder, 1)
 
     def set_participant_name(self, name: str):
@@ -223,6 +537,29 @@ class SensorTile(QtWidgets.QWidget):
             event.acceptProposedAction()
         except Exception:
             event.ignore()
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent):
+        menu = QtWidgets.QMenu(self)
+        has_sensor = bool(self.assigned_last6)
+
+        act_stop = menu.addAction("Stop live (unsubscribe)")
+        act_stop.setEnabled(has_sensor)
+        act_clear = menu.addAction("Clear tile")
+        act_clear.setEnabled(has_sensor)
+
+        chosen = menu.exec_(event.globalPos())
+        if chosen is None:
+            return
+        if chosen is act_stop and has_sensor:
+            # Ask main window to stop the session but keep assignment visible
+            self.stopRequested.emit(self.assigned_last6, self.tile_index)
+        elif chosen is act_clear and has_sensor:
+            # Ask main window to clear this tile entirely (also stops session)
+            self.clearRequested.emit(self.assigned_last6, self.tile_index)
+
+    def mark_stopped(self):
+        if self.assigned_last6:
+            self.info_label.setText(f"Sensor {self.assigned_last6} · Stopped")
 
 # --- FlagHandler remains unchanged ---
 class FlagHandler(logging.Handler):
@@ -449,6 +786,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # DnD selection state
         self.selected_slots = {}  # tile_index -> last6
         self.last6_to_tile = {}   # last6 -> tile_index
+        # Live ECG sessions keyed by last6
+        self.live_sessions = {}
+        self.live_sample_counts = {}
+        # Fast lookup for tiles by index
+        self.tile_index_map = {}
+        # Per-sensor ring buffers for plotting (≈10s @ 200 Hz)
+        self.live_buffers = {}
+        self.max_buffer = 2000
+
+        # Plot refresh timer (~20 FPS)
+        self.plot_timer = QtCore.QTimer(self)
+        self.plot_timer.timeout.connect(self._refresh_plots)
+        self.plot_timer.start(50)
+        
         self._setup_ui()
         self._create_menu()  # Create menu including About
         self._start_scanner()
@@ -639,17 +990,134 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_slots[tile_index] = last6
         self.last6_to_tile[last6] = tile_index
         target_tile.assign_sensor(last6, display_name)
-        # (Streaming/subscription logic will be added later.)
+        self._ensure_session_running(last6, address)
 
     def clear_tile_assignment(self, tile_index: int):
         """Unassign a tile (placeholder only)."""
         last6 = self.selected_slots.pop(tile_index, None)
         if last6:
             self.last6_to_tile.pop(last6, None)
+            self._stop_session(last6)
+            self.live_buffers.pop(last6, None)
         for t in self.tiles.values():
             if t.tile_index == tile_index:
                 t.set_placeholder(True)
                 break
+
+
+    def _ensure_session_running(self, last6: str, address: str = ""):
+        """Create and start a live ECG session for the given sensor if not already running."""
+        if last6 in self.live_sessions:
+            return
+        sess = MovesenseECGSession(last6, addr=address)
+        self.live_sessions[last6] = sess
+        self.live_sample_counts[last6] = 0
+        sess.signals.status.connect(self._on_ecg_status)
+        sess.signals.subscribed.connect(self._on_ecg_subscribed)
+        sess.signals.samples.connect(self._on_ecg_samples)
+        sess.signals.ecg.connect(self._on_ecg_chunk)
+        sess.start()
+
+    def _stop_session(self, last6: str):
+        sess = self.live_sessions.pop(last6, None)
+        if sess:
+            try:
+                sess.stop()
+            except Exception:
+                pass
+        # Drop counters and buffers so nothing continues updating visually
+        self.live_sample_counts.pop(last6, None)
+        self.live_buffers.pop(last6, None)
+
+    @QtCore.pyqtSlot(str, str)
+    def _on_ecg_status(self, last6: str, message: str):
+        tile_idx = self.last6_to_tile.get(last6)
+        tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
+        if tile:
+            tile.info_label.setText(f"Sensor {last6} · ECG -- Hz · {message}")
+        self.log_message(f"[ECG {last6}] {message}")
+
+    @QtCore.pyqtSlot(str, int)
+    def _on_ecg_subscribed(self, last6: str, sr: int):
+        tile_idx = self.last6_to_tile.get(last6)
+        tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
+        if tile:
+            addr = getattr(self.live_sessions.get(last6), "_addr", None)
+            if addr:
+                tile.info_label.setText(f"Sensor {last6} · ECG {sr} Hz · {addr} · Live")
+            else:
+                tile.info_label.setText(f"Sensor {last6} · ECG {sr} Hz · Live")
+
+    @QtCore.pyqtSlot(str, int)
+    def _on_ecg_samples(self, last6: str, inc: int):
+        self.live_sample_counts[last6] = self.live_sample_counts.get(last6, 0) + inc
+        tile_idx = self.last6_to_tile.get(last6)
+        tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
+        if tile:
+            count = self.live_sample_counts[last6]
+            tile.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Samples {count}")
+
+    @QtCore.pyqtSlot(str, object)
+    def _on_ecg_chunk(self, last6: str, values):
+        # Initialize deque if needed
+        if last6 not in self.live_buffers:
+            self.live_buffers[last6] = deque(maxlen=self.max_buffer)
+        try:
+            self.live_buffers[last6].extend(values)
+        except Exception:
+            # If 'values' isn't iterable for some reason, ignore
+            pass
+        try:
+            if len(self.live_buffers[last6]) % 160 == 0:
+                buf = self.live_buffers[last6]
+                try:
+                    ymin = min(buf)
+                    ymax = max(buf)
+                except Exception:
+                    ymin = ymax = 0.0
+                logging.info(f"[plot {last6}] buffer={len(buf)} min={ymin:.6f} max={ymax:.6f}")
+        except Exception:
+            pass
+
+    def _refresh_plots(self):
+        if not HAVE_PG:
+            return
+        # Iterate over tiles by index for stable layout mapping
+        for tile in self.tile_index_map.values():
+            if not hasattr(tile, 'curve'):
+                continue
+            last6 = getattr(tile, 'assigned_last6', None)
+            if not last6:
+                tile.curve.setData([])
+                continue
+            buf = self.live_buffers.get(last6)
+            if not buf or len(buf) == 0:
+                continue
+            y = list(buf)
+            if not y:
+                tile.curve.setData([])
+                continue
+            if HAVE_NP:
+                y_arr = np.asarray(y, dtype=float)
+            else:
+                y_arr = y
+            x = list(range(len(y)))
+            tile.curve.setData(x=x, y=y_arr)
+            # Maintain a sliding x-window
+            try:
+                tile.plot.setXRange(max(0, len(y) - self.max_buffer), max(1, len(y)))
+            except Exception:
+                pass
+            # Keep fixed Y range between -2 and 2 mV
+            try:
+                tile.plot.setYRange(-2, 2)
+                tile.plot.disableAutoRange('y')
+            except Exception:
+                pass
+            try:
+                tile.plot.repaint()
+            except Exception:
+                pass
     def rebuild_sensor_table(self):
         # Rebuild the table and timers using self.sensor_list and self.sensor_map
         num_sensors = len(self.sensor_list)
@@ -726,9 +1194,34 @@ class MainWindow(QtWidgets.QMainWindow):
             pname = self.sensor_map.get(last6, last6)
             tile = SensorTile(sensor_last6=last6, participant_name=pname, parent=self, tile_index=idx)
             tile.sensorDropped.connect(self.on_sensor_dropped)
+            tile.stopRequested.connect(self.on_tile_stop_requested)
+            tile.clearRequested.connect(self.on_tile_clear_requested)
             tile.set_placeholder(True)
             self.qa_grid.addWidget(tile, row, col)
+            self.tile_index_map[idx] = tile       # lookup by tile index (used by drop handlers)
             self.tiles[last6] = tile
+
+
+    @QtCore.pyqtSlot(str, int)
+    def on_tile_stop_requested(self, last6: str, tile_index: int):
+        # Unsubscribe/stop live session for this sensor but keep the tile assigned
+        self._stop_session(last6)
+        tile = self.tile_index_map.get(tile_index)
+        if tile:
+            try:
+                tile.mark_stopped()
+            except Exception:
+                tile.info_label.setText(f"Sensor {last6} · Stopped")
+        self.log_message(f"[ECG {last6}] stopped by user.")
+
+    @QtCore.pyqtSlot(str, int)
+    def on_tile_clear_requested(self, last6: str, tile_index: int):
+        # Stop and clear the tile back to placeholder
+        self._stop_session(last6)
+        self.clear_tile_assignment(tile_index)
+        # Small delay to allow BLE to fully disconnect so advertising resumes
+        QtCore.QTimer.singleShot(300, lambda: None)
+        self.log_message(f"[ECG {last6}] cleared from tile by user.")
 
     def toggle_mode(self):
         # (Mode toggle retained for potential future behavior changes.)
@@ -1052,8 +1545,18 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def closeEvent(self, event):
         if hasattr(self, "scanner_thread"):
-            self.scanner_thread.stop()
-            self.scanner_thread.wait()
+            try:
+                self.scanner_thread.stop()
+                self.scanner_thread.wait()
+            except Exception:
+                pass
+        # Stop ECG sessions
+        try:
+            for last6, sess in list(self.live_sessions.items()):
+                sess.stop()
+            QtCore.QThread.msleep(200)
+        except Exception:
+            pass
         event.accept()
 
 
