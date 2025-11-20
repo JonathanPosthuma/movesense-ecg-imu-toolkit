@@ -237,51 +237,18 @@ class MovesenseECGSession(QtCore.QObject):
             self.signals.status.emit(self.last6, "Connected; enabling notifications")
             await self._client.start_notify(NOTIFY_CHARACTERISTIC_UUID, self._on_notify)
 
-            # Prefer RAW int32 ECG (matches our parser: timestamp + 16×int32) and fallback to /mV floats if needed.
+            # Subscribe directly to the float/mV ECG path; the parser supports float32 too.
             ref = 100
-            path_raw = "/Meas/ECG/200"
-            path_mv = "/Meas/ECG/200/mV"
-
-            tried_mv = False
+            path = "/Meas/ECG/200/mV"
             try:
-                payload_raw = bytearray([1, ref]) + bytearray(path_raw, "utf-8")
-                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload_raw, response=True)
+                payload = bytearray([1, ref]) + bytearray(path, "utf-8")
+                await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload, response=True)
                 self.signals.subscribed.emit(self.last6, 200)
-                self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path_raw}")
+                self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path}")
             except Exception as e:
-                logging.info(f"[ECG {self.last6}] subscribe to {path_raw} failed: {e}")
-                tried_mv = True
-                try:
-                    payload_mv = bytearray([1, ref]) + bytearray(path_mv, "utf-8")
-                    await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload_mv, response=True)
-                    self.signals.subscribed.emit(self.last6, 200)
-                    self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path_mv}")
-                except Exception as e2:
-                    self.signals.status.emit(self.last6, f"Subscribe failed: {e2}")
-                    return
-
-            async def _notify_watchdog():
-                try:
-                    await asyncio.sleep(3)
-                    if self._pkt_counter == 0:
-                        self.signals.status.emit(self.last6, "No ECG packets yet – switching path")
-                        try:
-                            await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, bytearray([2, ref]), response=True)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.1)
-                        try:
-                            # toggle: if we tried RAW first, try /mV; else try RAW
-                            next_path = path_mv if not tried_mv else path_raw
-                            payload2 = bytearray([1, ref]) + bytearray(next_path, "utf-8")
-                            await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload2, response=True)
-                            self.signals.status.emit(self.last6, f"Retry subscribed {next_path}")
-                        except Exception as e3:
-                            self.signals.status.emit(self.last6, f"Fallback subscribe failed: {e3}")
-                except Exception:
-                    pass
-            if not self._stopping and (self._stop_event is None or not self._stop_event.is_set()):
-                self._watchdog_task = asyncio.create_task(_notify_watchdog())
+                self.signals.status.emit(self.last6, f"Subscribe failed: {e}")
+                logging.error(f"[ECG {self.last6}] subscribe to {path} failed: {e}")
+                return
         except Exception as e:
             logging.error(f"[ECG {self.last6}] setup error: {e}")
             self.signals.status.emit(self.last6, f"Error: {e}")
@@ -431,8 +398,8 @@ class SensorTile(QtWidgets.QWidget):
         self.name_label.setAlignment(Qt.AlignCenter)
         outer.addWidget(self.name_label)
 
-        # Info line: sensor id & placeholders for Batt/RSSI/Drops
-        self.info_label = QtWidgets.QLabel(f"Sensor {self.sensor_last6} · ECG 200 Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
+        # Info line: sensor id & simplified info (no Batt/RSSI placeholders)
+        self.info_label = QtWidgets.QLabel(f"Sensor {self.sensor_last6} · ECG 200 Hz · Samples 0")
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setStyleSheet("color: #555;")
         outer.addWidget(self.info_label)
@@ -446,7 +413,7 @@ class SensorTile(QtWidgets.QWidget):
             self.plot.setBackground('w')  # solid white to avoid transparent theme issues
             self.plot.setDownsampling(auto=True, mode='peak')
             self.plot.setClipToView(True)
-            self.plot.enableAutoRange('xy', True)
+            # We'll control ranges manually in _refresh_plots
             self.curve = self.plot.plot([], pen=pg.mkPen('k', width=1))  # black line
             self.plot.setMenuEnabled(False)
             self.plot.hideButtons()
@@ -792,6 +759,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Live ECG sessions keyed by last6
         self.live_sessions = {}
         self.live_sample_counts = {}
+        # Per-sensor auto-restart helpers for the "16 samples then stuck" behaviour
+        self.live_restart_timers = {}
+        self.live_auto_restart_done = {}
         # Fast lookup for tiles by index
         self.tile_index_map = {}
         # Per-sensor ring buffers for plotting (≈10s @ 200 Hz)
@@ -833,6 +803,7 @@ class MainWindow(QtWidgets.QMainWindow):
         discovered_label.setStyleSheet("color:#333;")
         self.discovered_list = DiscoveredList()
         self.discovered_list.setUniformItemSizes(True)
+        self.discovered_list.itemDoubleClicked.connect(self.on_discovered_double_clicked)
 
         left_layout.addWidget(discovered_label)
         left_layout.addWidget(self.discovered_list)
@@ -1015,6 +986,14 @@ class MainWindow(QtWidgets.QMainWindow):
         sess = MovesenseECGSession(last6, addr=address)
         self.live_sessions[last6] = sess
         self.live_sample_counts[last6] = 0
+        # Prepare a per-sensor timer to detect "stuck at 16 samples" on first connect
+        if last6 not in self.live_restart_timers:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda l=last6: self._check_and_restart_live(l))
+            self.live_restart_timers[last6] = timer
+        # Reset the auto-restart flag whenever we start a fresh session
+        self.live_auto_restart_done[last6] = False
         sess.signals.status.connect(self._on_ecg_status)
         sess.signals.subscribed.connect(self._on_ecg_subscribed)
         sess.signals.samples.connect(self._on_ecg_samples)
@@ -1028,9 +1007,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 sess.stop()
             except Exception:
                 pass
-        # Drop counters and buffers so nothing continues updating visually
+        # Drop counters, buffers, and restart helpers so nothing continues updating visually
         self.live_sample_counts.pop(last6, None)
         self.live_buffers.pop(last6, None)
+        t = self.live_restart_timers.pop(last6, None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        self.live_auto_restart_done.pop(last6, None)
 
     @QtCore.pyqtSlot(str, str)
     def _on_ecg_status(self, last6: str, message: str):
@@ -1054,11 +1040,39 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(str, int)
     def _on_ecg_samples(self, last6: str, inc: int):
         self.live_sample_counts[last6] = self.live_sample_counts.get(last6, 0) + inc
+        count = self.live_sample_counts[last6]
+        # If we see exactly 16 samples on a fresh session, arm a timer to auto-restart
+        # if no further samples arrive (the "stuck at 16" behaviour).
+        if count == 16 and not self.live_auto_restart_done.get(last6, False):
+            timer = self.live_restart_timers.get(last6)
+            if timer is not None and not timer.isActive():
+                # Check again in 2 seconds whether more samples came in
+                timer.start(2000)
         tile_idx = self.last6_to_tile.get(last6)
         tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
         if tile:
-            count = self.live_sample_counts[last6]
             tile.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Samples {count}")
+
+    def _check_and_restart_live(self, last6: str):
+        """If a sensor is still stuck at 16 samples after a short delay, restart its live session."""
+        # Mark that we've attempted one automatic restart to avoid infinite loops.
+        self.live_auto_restart_done[last6] = True
+        count = self.live_sample_counts.get(last6, 0)
+        sess = self.live_sessions.get(last6)
+        if sess is None:
+            return
+        if count > 16:
+            # Stream has progressed; nothing to do.
+            return
+        # We are still at or below 16 samples → emulate the manual disconnect+reconnect.
+        addr = getattr(sess, "_addr", "")
+        self.log_message(f"[ECG {last6}] Auto-restarting live session (stuck at {count} samples).")
+        # Stop the current session cleanly.
+        self._stop_session(last6)
+        # Recreate the session if the tile is still assigned.
+        tile_idx = self.last6_to_tile.get(last6)
+        if tile_idx is not None:
+            self._ensure_session_running(last6, addr)
 
     @QtCore.pyqtSlot(str, object)
     def _on_ecg_chunk(self, last6: str, values):
@@ -1111,16 +1125,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 tile.plot.setXRange(max(0, len(y) - self.max_buffer), max(1, len(y)))
             except Exception:
                 pass
-            # Keep fixed Y range between -2 and 2 mV
-            try:
-                tile.plot.setYRange(-2, 2)
-                tile.plot.disableAutoRange('y')
-            except Exception:
-                pass
+            # Y range is fixed in SensorTile.__init__; no need to reapply each frame.
             try:
                 tile.plot.repaint()
             except Exception:
                 pass
+
+    @QtCore.pyqtSlot(QtWidgets.QListWidgetItem)
+    def on_discovered_double_clicked(self, item):
+        """Double-click on a discovered sensor to start live view without drag-and-drop."""
+        data = item.data(Qt.UserRole) or {}
+        last6 = (data.get("last6") or "").strip()
+        address = data.get("address", "")
+        if not last6:
+            name = data.get("name", "")
+            m = re.findall(r"(\d{6,})", name)
+            if m:
+                last6 = m[-1][-6:]
+        if not last6:
+            self.log_message("Double-clicked device without valid sensor ID; ignoring.")
+            return
+
+        # Decide which tile to use:
+        tile_index = None
+        # 1) If already assigned to a tile, reuse that tile.
+        if last6 in self.last6_to_tile:
+            tile_index = self.last6_to_tile[last6]
+        # 2) If in sensor_list, use its "home" tile from the mapping.
+        elif last6 in self.sensor_list:
+            tile = self.tiles.get(last6)
+            if tile is not None:
+                tile_index = tile.tile_index
+        # 3) Otherwise, pick the first empty tile.
+        else:
+            for idx, tile in self.tile_index_map.items():
+                if tile.assigned_last6 is None:
+                    tile_index = idx
+                    break
+
+        if tile_index is None:
+            self.log_message(f"No available tile for sensor {last6}; cannot start live view.")
+            return
+
+        # Reuse the existing logic for assigning and starting live.
+        self.on_sensor_dropped(last6, address, tile_index)
     def rebuild_sensor_table(self):
         # Rebuild the table and timers using self.sensor_list and self.sensor_map
         num_sensors = len(self.sensor_list)
