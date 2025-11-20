@@ -780,7 +780,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Movesense Data Tool")
         self.setGeometry(100, 100, 800, 600)
         self.found_sensor_ids = []
+        # Mapping from sensor_last6 -> display label (NAME or PID) used in UI
         self.sensor_map = {}
+        # Separate mapping from sensor_last6 -> PID (2nd column) used only for filenames
+        self.sensor_pid_map = {}
         self.day_number = None
         self.sensor_list = []  # dynamic list from CSV (last 6 digits)
         # DnD selection state
@@ -1265,6 +1268,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         mapping = {}
+        pid_map = {}
         try:
             order = []
             with open(path, newline="") as f:
@@ -1273,16 +1277,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     if not row or len(row) < 2:
                         continue
                     s = row[0].strip()
-                    # Prefer 3rd column as NAME; fallback to 2nd if 3rd missing or empty
-                    p = row[2].strip() if len(row) >= 3 and row[2].strip() else row[1].strip()
+                    # Column 1: PID (always used for file naming)
+                    pid = row[1].strip() if len(row) >= 2 else ""
+                    # Column 2: NAME (preferred for display in the program)
+                    name = ""
+                    if len(row) >= 3 and row[2].strip():
+                        name = row[2].strip()
+                    # For UI display, prefer NAME (3rd col) and fall back to PID (2nd col)
+                    p = name or pid
                     s_digits = re.sub(r"\D", "", s)
-                    if len(s_digits) >= 6 and p:
+                    if len(s_digits) >= 6 and pid:
                         key = s_digits[-6:]
                         if key not in mapping:
                             order.append(key)
+                        # What the UI shows
                         mapping[key] = p
+                        # What filenames use (always PID from col 2)
+                        pid_map[key] = pid
             if mapping:
-                self.sensor_map = mapping
+                self.sensor_map = mapping              # last6 -> NAME (or PID) for display
+                self.sensor_pid_map = pid_map          # last6 -> PID for filenames
                 self.sensor_list = order  # dynamic list in CSV order
                 self.mapping_label.setText(f"Mapping loaded: {len(mapping)} entries")
                 self.log_message(f"Loaded mapping CSV: {path} with {len(mapping)} entries")
@@ -1290,7 +1304,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.rebuild_qa_tiles()
             else:
                 QtWidgets.QMessageBox.warning(
-                    self, "Mapping CSV", "No valid 'sensor_last6,participantID' rows found.")
+                    self, "Mapping CSV", "No valid 'sensor_last6,PID,NAME' rows found.")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Mapping CSV", f"Failed to load mapping: {e}")
 
@@ -1305,7 +1319,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def build_target_stem(self, sensor_last6: str) -> str:
         """Return desired base filename without extension, e.g., PID_040625_3"""
-        pid = self.sensor_map.get(sensor_last6)
+        pid = self.sensor_pid_map.get(sensor_last6) or self.sensor_map.get(sensor_last6)
         if not pid:
             logging.debug(f"[target] no pid for last6={sensor_last6}")
             return ""
@@ -1491,7 +1505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_message("Starting extraction for sensors: " + ", ".join(sensors_to_extract))
         self.extraction_thread = ExtractionThread(
             sensors_to_extract, raw_folder, conv_folder, self.found_sensor_ids,
-            sensor_map=self.sensor_map, day_number=self.day_number)
+            sensor_map=(self.sensor_pid_map or self.sensor_map), day_number=self.day_number)
         self.extraction_thread.extractionResult.connect(self.handle_extraction_result)
         self.extraction_thread.extractionStarted.connect(self.handle_extraction_started)
         self.extraction_thread.start()
