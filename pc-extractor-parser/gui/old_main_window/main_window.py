@@ -14,7 +14,6 @@ from collections import deque
 
 from datetime import datetime
 
-
 # Optionally import numpy for fast array operations in plotting
 try:
     import numpy as np
@@ -31,12 +30,6 @@ WRITE_CHARACTERISTIC_UUID = "34800001-7185-4d5d-b431-630e7050e8f0"
 NOTIFY_CHARACTERISTIC_UUID = "34800002-7185-4d5d-b431-630e7050e8f0"
 PACKET_TYPE_DATA = 2
 PACKET_TYPE_DATA_PART2 = 3
-BATTERY_LEVEL_CHAR_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
-
-# Custom command ID for new GATT battery command
-
-CMD_GET_BATTERY_LEVEL = 9
-
 
 # Optional plotting (falls back gracefully if not installed yet)
 try:
@@ -91,9 +84,10 @@ class ScannerThread(QtCore.QThread):
         asyncio.set_event_loop(loop)
         while self._running:
             try:
-                devices = loop.run_until_complete(BleakScanner.discover())
-                # Emit all devices; some platforms return empty names unless you keep adv data.
-                self.devicesFound.emit(devices)
+                devices = loop.run_until_complete(discover())
+                # Filter for Movesense devices (adjust filter if needed)
+                movesense_devices = [d for d in devices if d.name and d.name.startswith("Movesense")]
+                self.devicesFound.emit(movesense_devices)
             except Exception as e:
                 print("Error during scanning:", e)
             self.msleep(1000)
@@ -126,7 +120,6 @@ class ECGSignals(QtCore.QObject):
     subscribed = QtCore.pyqtSignal(str, int) # last6, sample_rate
     samples = QtCore.pyqtSignal(str, int)    # last6, count_increment
     ecg = QtCore.pyqtSignal(str, object)     # last6, list[float] (mV)
-    battery = QtCore.pyqtSignal(str, int)    # last6, percent
 
 class MovesenseECGSession(QtCore.QObject):
     """One live ECG subscription session for a sensor (last6). Connects and subscribes at 200 Hz."""
@@ -144,8 +137,6 @@ class MovesenseECGSession(QtCore.QObject):
         self._first_dump_done = False
         self._stopping = False
         self._watchdog_task = None
-        self._battery_task = None
-        self._pending_get = {}  # ref -> asyncio.Future
 
     # ---- lifecycle ----
     def start(self):
@@ -176,21 +167,8 @@ class MovesenseECGSession(QtCore.QObject):
                 self._watchdog_task.cancel()
         except Exception:
             pass
-        # Cancel battery task if any
-        try:
-            if self._battery_task:
-                self._battery_task.cancel()
-        except Exception:
-            pass
         # Finally signal the main stop event to unwind the thread
         QtCore.QMetaObject.invokeMethod(self, "_request_stop", Qt.QueuedConnection)
-        # If stop() is called from the main thread, it is safe to wait for the worker thread to finish.
-        try:
-            if self._thread and QtCore.QThread.currentThread() is not self._thread:
-                self._thread.quit()
-                self._thread.wait(2500)
-        except Exception:
-            pass
     async def _force_unsubscribe_disconnect(self):
         try:
             if self._client and self._client.is_connected:
@@ -232,12 +210,7 @@ class MovesenseECGSession(QtCore.QObject):
                 self._loop.stop(); self._loop.close()
             except Exception:
                 pass
-            # We are executing inside this QThread, so NEVER call wait() here (it would be waiting on itself).
-            # Request the thread to quit; the owner (main thread) can wait/join if needed.
-            try:
-                self._thread.quit()
-            except Exception:
-                pass
+            self._thread.quit(); self._thread.wait()
             self._thread = None
             self._loop = None
             self._stop_event = None
@@ -264,15 +237,6 @@ class MovesenseECGSession(QtCore.QObject):
             self.signals.status.emit(self.last6, "Connected; enabling notifications")
             await self._client.start_notify(NOTIFY_CHARACTERISTIC_UUID, self._on_notify)
 
-            # Initial battery query before starting high-rate ECG stream (command responses may be dropped during ECG spam)
-            try:
-                pct0 = await self._read_battery_level_with_retries(attempts=4, delay_s=0.25)
-                if pct0 is not None:
-                    self.signals.battery.emit(self.last6, int(pct0))
-                    self.signals.status.emit(self.last6, f"Battery initial: {int(pct0)}%")
-            except Exception:
-                pass
-
             # Subscribe directly to the float/mV ECG path; the parser supports float32 too.
             ref = 100
             path = "/Meas/ECG/200/mV"
@@ -281,12 +245,6 @@ class MovesenseECGSession(QtCore.QObject):
                 await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload, response=True)
                 self.signals.subscribed.emit(self.last6, 200)
                 self.signals.status.emit(self.last6, f"Subscribed ECG 200 Hz {path}")
-                # Start periodic battery polling (best-effort)
-                try:
-                    if not self._battery_task:
-                        self._battery_task = asyncio.create_task(self._battery_loop())
-                except Exception:
-                    pass
             except Exception as e:
                 self.signals.status.emit(self.last6, f"Subscribe failed: {e}")
                 logging.error(f"[ECG {self.last6}] subscribe to {path} failed: {e}")
@@ -295,151 +253,12 @@ class MovesenseECGSession(QtCore.QObject):
             logging.error(f"[ECG {self.last6}] setup error: {e}")
             self.signals.status.emit(self.last6, f"Error: {e}")
 
-    async def _battery_loop(self):
-        """Periodically read battery level and emit to UI. Best-effort and non-fatal."""
-        await asyncio.sleep(0.5)
-        while not self._stopping and self._client and self._client.is_connected:
-            try:
-                pct = await self._read_battery_level_with_retries(attempts=3, delay_s=0.2)
-                if pct is not None:
-                    self.signals.battery.emit(self.last6, int(pct))
-                    try:
-                        self.signals.status.emit(self.last6, f"Battery level: {int(pct)}%")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            await asyncio.sleep(60)
-
-    async def _read_battery_level_with_retries(self, attempts: int = 3, delay_s: float = 0.15):
-        """Battery GET responses use BLE Notify and can be dropped during high-rate ECG streaming.
-        Retry a few times to improve robustness.
-        """
-        for i in range(max(1, attempts)):
-            pct = await self._read_battery_level()
-            if pct is not None:
-                return pct
-            await asyncio.sleep(delay_s)
-        return None
-
-    async def _read_battery_level(self):
-        """Return battery percent (0-100) if available, else None.
-
-        NOTE: Some Movesense firmware exposes BLE Battery Level (0x2A19) with a static/placeholder value.
-        We therefore prefer the custom firmware command GET_BATTERY_LEVEL (id=9) and only fall back to 0x2A19
-        if the command is unavailable.
-        """
-        if not self._client or not self._client.is_connected:
-            return None
-
-        # 1) Prefer custom firmware command GET_BATTERY_LEVEL (id=9)
-        try:
-            ref = 101  # arbitrary ref id not used by ECG (100)
-            loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            self._pending_get[ref] = fut
-
-            # Command payload: [CMD_GET_BATTERY_LEVEL, ref]
-            payload = bytearray([CMD_GET_BATTERY_LEVEL, ref])
-            await self._client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload, response=True)
-
-            try:
-                data = await asyncio.wait_for(fut, timeout=3.0)
-                try:
-                    preview = " ".join(f"{b:02X}" for b in bytes(data)[:16])
-                    logging.info(f"[ECG {self.last6}] Battery CMD raw (first 16): {preview}")
-                    try:
-                        self.signals.status.emit(self.last6, f"Battery CMD raw: {preview}")
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-            finally:
-                self._pending_get.pop(ref, None)
-
-            pct = self._parse_battery_from_get_payload(data)
-            if pct is not None:
-                try:
-                    self.signals.status.emit(self.last6, f"Battery (CMD {CMD_GET_BATTERY_LEVEL}): {int(pct)}%")
-                except Exception:
-                    pass
-                return int(pct)
-        except Exception:
-            try:
-                self._pending_get.pop(101, None)
-            except Exception:
-                pass
-
-        # 2) Fallback: Try standard BLE Battery Level characteristic (if exposed)
-        try:
-            b = await self._client.read_gatt_char(BATTERY_LEVEL_CHAR_UUID)
-            if b:
-                v = int(b[0])
-                if 0 <= v <= 100:
-                    logging.info(f"[ECG {self.last6}] Battery via BLE 0x2A19: {v}%")
-                    try:
-                        self.signals.status.emit(self.last6, f"Battery (BLE 2A19 fallback): {v}%")
-                    except Exception:
-                        pass
-                    return v
-        except Exception:
-            pass
-
-        return None
-
-    def _parse_battery_from_get_payload(self, data: bytearray):
-        """Parse battery percentage from a COMMAND_RESPONSE to our custom battery command.
-
-        Per GSP spec, GET response format is:
-          [0] 0x01 (COMMAND_RESPONSE)
-          [1] ref
-          [2..3] status uint16 little-endian (e.g., 200 = 0xC8 0x00)
-          [4..] payload in GSP binary format (little-endian primitives)
-
-        For GET_BATTERY_LEVEL the payload is expected to be a single byte (uint8) percentage.
-        We treat the first payload byte as uint8 percent (0..100), and fall back to uint16.
-        """
-        if not data:
-            return None
-        raw = bytes(data)
-        if len(raw) < 5:
-            return None
-        # Must be COMMAND_RESPONSE
-        if raw[0] != 0x01:
-            return None
-        # Status code
-        status = int.from_bytes(raw[2:4], byteorder='little', signed=False)
-        if status < 200 or status >= 300:
-            return None
-        payload = raw[4:]
-        if not payload:
-            return None
-
-        # Most common: uint8 percent
-        v8 = payload[0]
-        if 0 <= v8 <= 100:
-            return int(v8)
-
-        # Fallback: uint16 percent
-        if len(payload) >= 2:
-            v16 = int.from_bytes(payload[0:2], byteorder='little', signed=False)
-            if 0 <= v16 <= 100:
-                return int(v16)
-        return None
-
     async def _cleanup(self):
         # Cancel watchdog
         try:
             if self._watchdog_task:
                 self._watchdog_task.cancel()
                 self._watchdog_task = None
-        except Exception:
-            pass
-        # Cancel battery task
-        try:
-            if self._battery_task:
-                self._battery_task.cancel()
-                self._battery_task = None
         except Exception:
             pass
         try:
@@ -471,17 +290,6 @@ class MovesenseECGSession(QtCore.QObject):
         try:
             if self._stopping:
                 return
-            # Intercept pending command responses (e.g., GET battery) so we don't try to parse them as ECG
-            # NOTE: GET responses are COMMAND_RESPONSE packets (0x01), not DATA (0x02).
-            try:
-                if data and len(data) >= 4 and data[0] == 0x01:
-                    ref = int(data[1])
-                    fut = self._pending_get.get(ref)
-                    if fut is not None and not fut.done():
-                        fut.set_result(data)
-                        return
-            except Exception:
-                pass
             self._pkt_counter += 1
             if not self._first_dump_done:
                 try:
@@ -493,7 +301,7 @@ class MovesenseECGSession(QtCore.QObject):
             values = []
             d = DataView(data)
             parsed = False
-            # Attempt int32 RAW format: [2,type_ref][4B timestamp][16×int32]
+            # Attempt RAW format: [2,type_ref][4B timestamp][16×int32]
             try:
                 base = 6
                 vals = [d.get_int_32(base + i*4) * 0.00038 for i in range(16)]  # mV (0.38 µV/LSB)
@@ -503,20 +311,11 @@ class MovesenseECGSession(QtCore.QObject):
                     parsed = True
             except Exception:
                 parsed = False
-            # If RAW failed or looks insane, try float32.
-            # We have seen packets shaped like:
-            #   [0]=0x02 (DATA), [1]=ref (100), [2..5]=uint32 timestamp, [6..]=16×float32 mV  (len=70)
-            # Older/other variants may omit the timestamp and start floats at offset 2.
+            # If RAW failed or looks insane, try float32 array (no timestamp): [2,type_ref][16×float32 mV]
             if not parsed:
                 try:
-                    raw_bytes = bytes(d.array)
-                    if len(raw_bytes) >= 70:
-                        # Timestamp present
-                        base = 6
-                    else:
-                        # No timestamp
-                        base = 2
-                    vals = [struct.unpack_from('<f', raw_bytes, base + i * 4)[0] for i in range(16)]
+                    base = 2
+                    vals = [struct.unpack_from('<f', bytes(d.array), base + i*4)[0] for i in range(16)]
                     values = vals
                     parsed = True
                 except Exception:
@@ -524,8 +323,6 @@ class MovesenseECGSession(QtCore.QObject):
             if not parsed:
                 self.signals.samples.emit(self.last6, 16)
                 return
-
-
             self.signals.samples.emit(self.last6, 16)
             self.signals.ecg.emit(self.last6, values)
         except Exception as e:
@@ -618,8 +415,6 @@ class SensorTile(QtWidgets.QWidget):
             self.plot.setClipToView(True)
             # We'll control ranges manually in _refresh_plots
             self.curve = self.plot.plot([], pen=pg.mkPen('k', width=1))  # black line
-            self.curve.setDownsampling(auto=False)
-            self.curve.setClipToView(False)   # optional; try toggling this too
             self.plot.setMenuEnabled(False)
             self.plot.hideButtons()
             self.plot.setMouseEnabled(x=False, y=False)
@@ -645,7 +440,7 @@ class SensorTile(QtWidgets.QWidget):
 
     def set_info(self, batt: str = "--", rssi: str = "--", drops: str = "0.0"):
         self.info_label.setText(
-            f"Sensor {self.sensor_last6} · ECG 200 Hz · Batt {batt}% · RSSI {rssi} dBm · Drops {drops}%"
+            f"Sensor {self.sensor_last6} · ECG 125 Hz · Batt {batt}% · RSSI {rssi} dBm · Drops {drops}%"
         )
 
     # For later: fast update of ECG trace
@@ -657,26 +452,18 @@ class SensorTile(QtWidgets.QWidget):
         """Switch visual between empty placeholder and active tile."""
         if is_placeholder:
             self.assigned_last6 = None
-            base_name = self.participant_name or self.sensor_last6
-            self.name_label.setText(f"{base_name} (empty)")
+            self.name_label.setText("Drop sensor here")
             self.name_label.setStyleSheet("color:#777;")
-            self.info_label.setText(f"Sensor {self.sensor_last6} · Not connected")
+            self.info_label.setText("No sensor assigned")
         else:
             self.name_label.setStyleSheet("")
-
-    def set_highlight(self, active: bool):
-        """Highlight this tile when it is the target for a sensor."""
-        if active:
-            self.setStyleSheet("border: 2px solid #4a90e2;")
-        else:
-            self.setStyleSheet("")
 
     def assign_sensor(self, last6: str, display_name: str):
         self.assigned_last6 = last6
         self.set_placeholder(False)
         self.participant_name = display_name or last6
         self.name_label.setText(self.participant_name)
-        self.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
+        self.info_label.setText(f"Sensor {last6} · ECG -- Hz · Batt --% · RSSI -- dBm · Drops 0.0%")
 
     # --- Drag & Drop handlers ---
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
@@ -972,7 +759,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Live ECG sessions keyed by last6
         self.live_sessions = {}
         self.live_sample_counts = {}
-        self.live_battery_levels = {}
         # Per-sensor auto-restart helpers for the "16 samples then stuck" behaviour
         self.live_restart_timers = {}
         self.live_auto_restart_done = {}
@@ -988,20 +774,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_timer.start(50)
         
         self._setup_ui()
-
-        # --- Default DATA folders ---
-        default_raw = "/Users/jonathan.posthuma/movesense-ecg-imu-toolkit/pc-extractor-parser/DATA/Raw"
-        default_conv = "/Users/jonathan.posthuma/movesense-ecg-imu-toolkit/pc-extractor-parser/DATA/Converted"
-
-        try:
-            os.makedirs(default_raw, exist_ok=True)
-            os.makedirs(default_conv, exist_ok=True)
-        except Exception as e:
-            logging.warning(f"Could not create default data folders: {e}")
-
-        self.raw_output_edit.setText(default_raw)
-        self.csv_output_edit.setText(default_conv)
-
         self._create_menu()  # Create menu including About
         self._start_scanner()
         self.statusBar().showMessage("Software signed by Jonathan Posthuma, Radboud University")
@@ -1032,7 +804,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.discovered_list = DiscoveredList()
         self.discovered_list.setUniformItemSizes(True)
         self.discovered_list.itemDoubleClicked.connect(self.on_discovered_double_clicked)
-        self.discovered_list.currentItemChanged.connect(self.on_discovered_current_changed)
 
         left_layout.addWidget(discovered_label)
         left_layout.addWidget(self.discovered_list)
@@ -1074,11 +845,6 @@ class MainWindow(QtWidgets.QMainWindow):
             + self.sensor_table.horizontalHeader().height()
             + 6
         )
-
-        # Allow double-clicking a sensor row to start live view
-        self.sensor_table.cellDoubleClicked.connect(self.on_sensor_table_double_clicked)
-        # Highlight the tile that will be used when selecting a row
-        self.sensor_table.currentCellChanged.connect(self.on_sensor_table_current_cell_changed)
 
         left_layout.addWidget(QtWidgets.QLabel("Sensor Extraction Status:"))
         left_layout.addWidget(self.sensor_table)
@@ -1163,27 +929,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Give left more width for tables; right will hold 4×4 plots
         splitter.setSizes([int(self.width() * 0.62), int(self.width() * 0.38)])
-
-    def clear_tile_highlights(self):
-        """Remove highlight from all tiles."""
-        for tile in self.tile_index_map.values():
-            if hasattr(tile, "set_highlight"):
-                tile.set_highlight(False)
-
-    def highlight_tile_for_sensor(self, last6: str):
-        """Highlight the tile that corresponds to the given sensor ID."""
-        self.clear_tile_highlights()
-        tile = self.tiles.get(last6)
-        if tile and hasattr(tile, "set_highlight"):
-            tile.set_highlight(True)
-    @QtCore.pyqtSlot(int, int, int, int)
-    def on_sensor_table_current_cell_changed(self, row, column, prev_row, prev_col):
-        """Highlight the tile for the sensor corresponding to the selected table row."""
-        if row < 0 or row >= len(self.sensor_list):
-            self.clear_tile_highlights()
-            return
-        last6 = self.sensor_list[row]
-        self.highlight_tile_for_sensor(last6)
     def on_sensor_dropped(self, last6: str, address: str, tile_index: int):
         """Handle a sensor being dropped onto a tile: assign or swap as needed."""
         # Find the target tile widget by index
@@ -1253,7 +998,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sess.signals.subscribed.connect(self._on_ecg_subscribed)
         sess.signals.samples.connect(self._on_ecg_samples)
         sess.signals.ecg.connect(self._on_ecg_chunk)
-        sess.signals.battery.connect(self._on_battery_level)
         sess.start()
 
     def _stop_session(self, last6: str):
@@ -1265,7 +1009,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         # Drop counters, buffers, and restart helpers so nothing continues updating visually
         self.live_sample_counts.pop(last6, None)
-        self.live_battery_levels.pop(last6, None)
         self.live_buffers.pop(last6, None)
         t = self.live_restart_timers.pop(last6, None)
         if t is not None:
@@ -1308,21 +1051,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tile_idx = self.last6_to_tile.get(last6)
         tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
         if tile:
-            batt = self.live_battery_levels.get(last6)
-            if batt is None:
-                tile.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Samples {count}")
-            else:
-                tile.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Batt {batt}% · Samples {count}")
-
-    @QtCore.pyqtSlot(str, int)
-    def _on_battery_level(self, last6: str, pct: int):
-        self.live_battery_levels[last6] = pct
-        tile_idx = self.last6_to_tile.get(last6)
-        tile = self.tile_index_map.get(tile_idx) if tile_idx is not None else None
-        if tile:
-            sr = getattr(self.live_sessions.get(last6), 'sample_rate', '--')
-            count = self.live_sample_counts.get(last6, 0)
-            tile.info_label.setText(f"Sensor {last6} · ECG {sr} Hz · Batt {pct}% · Samples {count}")
+            tile.info_label.setText(f"Sensor {last6} · ECG 200 Hz · Samples {count}")
 
     def _check_and_restart_live(self, last6: str):
         """If a sensor is still stuck at 16 samples after a short delay, restart its live session."""
@@ -1387,72 +1116,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             if HAVE_NP:
                 y_arr = np.asarray(y, dtype=float)
-                # ECG values should never be exactly zero;
-                # treat exact zeros as invalid samples to avoid vertical spike artifacts
-                y_arr[y_arr == 0] = np.nan
             else:
-                # fallback: filter zeros in pure-python mode
-                y_arr = [v if v != 0 else float('nan') for v in y]
-            tile.curve.setData(y_arr)
+                y_arr = y
+            x = list(range(len(y)))
+            tile.curve.setData(x=x, y=y_arr)
             # Maintain a sliding x-window
-            #try:
-            #    tile.plot.setXRange(max(0, len(y) - self.max_buffer), max(1, len(y)))
-            #except Exception:
-            #    pass
+            try:
+                tile.plot.setXRange(max(0, len(y) - self.max_buffer), max(1, len(y)))
+            except Exception:
+                pass
             # Y range is fixed in SensorTile.__init__; no need to reapply each frame.
             try:
                 tile.plot.repaint()
             except Exception:
                 pass
-
-    def start_live_for_sensor(self, last6: str, address: str = ""):
-        """Start live ECG view for the given sensor ID, choosing an appropriate tile."""
-        if not last6:
-            self.log_message("No valid sensor ID; cannot start live view.")
-            return
-
-        # Decide which tile to use:
-        tile_index = None
-        # 1) If already assigned to a tile, reuse that tile.
-        if last6 in self.last6_to_tile:
-            tile_index = self.last6_to_tile[last6]
-        # 2) If in sensor_list, use its 'home' tile from the mapping.
-        elif last6 in self.sensor_list:
-            tile = self.tiles.get(last6)
-            if tile is not None:
-                tile_index = tile.tile_index
-        # 3) Otherwise, pick the first empty tile.
-        else:
-            for idx, tile in self.tile_index_map.items():
-                if tile.assigned_last6 is None:
-                    tile_index = idx
-                    break
-
-        if tile_index is None:
-            self.log_message(f"No available tile for sensor {last6}; cannot start live view.")
-            return
-
-        # Reuse the existing drop logic for assigning the sensor and starting live.
-        self.on_sensor_dropped(last6, address, tile_index)
-        # Visually indicate which tile is now active for this sensor.
-        self.highlight_tile_for_sensor(last6)
-    @QtCore.pyqtSlot(QtWidgets.QListWidgetItem, QtWidgets.QListWidgetItem)
-    def on_discovered_current_changed(self, current, previous):
-        """When the selection changes in the discovered list, highlight the target tile."""
-        if current is None:
-            self.clear_tile_highlights()
-            return
-        data = current.data(Qt.UserRole) or {}
-        last6 = (data.get("last6") or "").strip()
-        if not last6:
-            name = data.get("name", "")
-            m = re.findall(r"(\d{6,})", name)
-            if m:
-                last6 = m[-1][-6:]
-        if not last6:
-            self.clear_tile_highlights()
-            return
-        self.highlight_tile_for_sensor(last6)
 
     @QtCore.pyqtSlot(QtWidgets.QListWidgetItem)
     def on_discovered_double_clicked(self, item):
@@ -1469,25 +1146,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log_message("Double-clicked device without valid sensor ID; ignoring.")
             return
 
-        self.start_live_for_sensor(last6, address)
+        # Decide which tile to use:
+        tile_index = None
+        # 1) If already assigned to a tile, reuse that tile.
+        if last6 in self.last6_to_tile:
+            tile_index = self.last6_to_tile[last6]
+        # 2) If in sensor_list, use its "home" tile from the mapping.
+        elif last6 in self.sensor_list:
+            tile = self.tiles.get(last6)
+            if tile is not None:
+                tile_index = tile.tile_index
+        # 3) Otherwise, pick the first empty tile.
+        else:
+            for idx, tile in self.tile_index_map.items():
+                if tile.assigned_last6 is None:
+                    tile_index = idx
+                    break
 
-    @QtCore.pyqtSlot(int, int)
-    def on_sensor_table_double_clicked(self, row: int, column: int):
-        """Double-click on a sensor in the status table to start live view."""
-        if row < 0 or row >= len(self.sensor_list):
+        if tile_index is None:
+            self.log_message(f"No available tile for sensor {last6}; cannot start live view.")
             return
-        last6 = self.sensor_list[row]
-        address = ""
 
-        # Try to look up the BLE address from the discovered list, if available.
-        for i in range(self.discovered_list.count()):
-            item = self.discovered_list.item(i)
-            data = item.data(Qt.UserRole) or {}
-            if (data.get("last6") or "").strip() == last6:
-                address = data.get("address", "")
-                break
-
-        self.start_live_for_sensor(last6, address)
+        # Reuse the existing logic for assigning and starting live.
+        self.on_sensor_dropped(last6, address, tile_index)
     def rebuild_sensor_table(self):
         # Rebuild the table and timers using self.sensor_list and self.sensor_map
         num_sensors = len(self.sensor_list)
@@ -1737,53 +1418,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_message("Started Bluetooth scanning...")
 
     def update_device_list(self, devices):
-        # Bleak on macOS occasionally returns an empty scan list transiently. Do not treat that as "no sensors".
-        if not devices:
-            return
         # Live discovered list
         self.discovered_list.clear()
         self.found_sensor_ids.clear()
 
-        entries = []
-
         for d in devices:
-            name = (d.name or "").strip()
+            name = d.name or "(unknown)"
             addr = getattr(d, "address", "")
 
-            # Only show Movesense sensors
-            if not name.startswith("Movesense"):
-                continue
+            # Build list item with payload for DnD
+            item = QtWidgets.QListWidgetItem(f"{name} ({addr})")
 
             last6_val = ""
-            display_text = f"{name} ({addr})"
+            if d.name and d.name.startswith("Movesense"):
+                parts = d.name.split(" ")
+                if len(parts) >= 2:
+                    full_id = parts[1].strip()          # e.g., "243330000071"
+                    last6_val = full_id[-6:]            # -> "000071"
+                    self.found_sensor_ids.append(last6_val)
 
-            parts = name.split(" ")
-            if len(parts) >= 2:
-                full_id = parts[1].strip()          # e.g., "243330000071"
-                last6_val = full_id[-6:]            # -> "000071"
-                # Prefer showing sensor ID plus mapped participant/ PID name if available.
-                label = self.sensor_map.get(last6_val)
-                if label:
-                    display_text = f"{last6_val} · {label} ({addr})"
-                else:
-                    display_text = f"{last6_val} ({addr})"
-
-            # Build list item with payload for DnD
-            item = QtWidgets.QListWidgetItem(display_text)
             # Attach metadata for drag payload
             item.setData(Qt.UserRole, {"name": name, "address": addr, "last6": last6_val})
-
-            # Use participant name if present, otherwise sensor ID or device name as sort key.
-            sort_key = self.sensor_map.get(last6_val) or last6_val or name
-            entries.append((str(sort_key), item, last6_val))
-
-        # Sort entries for a stable, user-friendly order.
-        entries.sort(key=lambda t: t[0])
-
-        for _, item, last6_val in entries:
             self.discovered_list.addItem(item)
-            if last6_val:
-                self.found_sensor_ids.append(last6_val)
 
         self.log_message(
             f"Found {len(self.found_sensor_ids)} of {len(self.sensor_list) if self.sensor_list else 0} expected sensors: {self.found_sensor_ids}"
@@ -1811,20 +1467,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.found_timers[sensor_index].start(10000)
     
     def handle_found_timeout(self, sensor_index):
-        # When the timer expires, if the sensor is still "Found" revert it to "Pending".
-        # BUT: if we currently have an active live session for this sensor, keep it as Found.
+        # When the timer expires, if the sensor is still "Found" revert it to "Pending"
         current_status = self.sensor_entries[sensor_index][1].text().strip().lower()
-        if current_status != "found":
-            return
-
-        sensor_id = self.sensor_list[sensor_index]
-        if sensor_id in self.live_sessions:
-            # Still connected/streaming (or at least intentionally active)
-            self.found_timers[sensor_index].start(10000)
-            return
-
-        self.update_sensor_status(sensor_index, "Pending")
-        self.log_message(f"Sensor {sensor_id} timed out; reverting to Pending.")
+        if current_status == "found":
+            self.update_sensor_status(sensor_index, "Pending")
+            self.log_message(f"Sensor {self.sensor_list[sensor_index]} timed out; reverting to Pending.")
     
     def log_message(self, message: str):
         self.status_text.append(message)

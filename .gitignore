@@ -25,3 +25,5 @@ pc-extractor-parser/build/
 
 # Local config
 pc-extractor-parser/config/settings.json
+pc-extractor-parser/dist/
+pc-extractor-parser/build/
