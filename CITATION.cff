@@ -4,6 +4,6 @@ authors:
   - family-names: "Posthuma"
     given-names: "Jonathan"
 title: "Movesense ECG & IMU Toolkit"
-version: "1.0.0"
+version: "1.1.0"
 date-released: 2025-08-13
 url: "https://github.com/JonathanPosthuma/movesense-ecg-imu-toolkit"
