@@ -1,128 +1,224 @@
-# Movesense ECG & IMU Toolkit 
-
-
+# Movesense ECG & IMU Toolkit
 
 ## Overview
 
-The **Movesense ECG & IMU Toolkit** is a Python-based GUI application for extracting long offline recordings from Movesense sensors and converting them into CSV. It supports both **ECG** and **IMU** streams, handles multiple sensors, and names output files using dynamic **ParticipantID + date + day** convention.
-For non-technical users, you can ship a one-click macOS app; for developers, you can run from source or customize.
+The **Movesense ECG & IMU Toolkit** is a Python-based desktop application for interacting with custom WinLogger-enabled Movesense sensors.
+
+The toolkit supports:
+
+- Offline log extraction and conversion to CSV
+- Real-time ECG streaming
+- Live battery monitoring
+- Multi-sensor workflows
+- Automatic parsing of ECG and IMU recordings
+- Participant-based file naming and organization
+
+For non-technical users, the toolkit can be distributed as a standalone macOS application. Developers can run the software directly from source and customize both the desktop application and sensor software.
+
+---
 
 ## Features
 
-- **Simple GUI (PyQt5):** Start/stop extraction and monitor sensor status at a glance.
-- **Dynamic sensor list:** Load a CSV mapping of `sensor_last6,participantID` to drive the grid and file naming.
-- **Batch extraction:** Extract from multiple sensors in one go; conversion runs automatically after extraction.
-- **Consistent file naming:** Output CSVs named `ParticipantID_DDMMYY_day.csv` (e.g., `3VSAN2PR_040625_3.csv`).
-- **Built-in conversion:** Parses SBEM logs (ECG mV packets & IMU6 format) into tidy CSV.
-- **Sensor software included:** Repo also contains the Movesense sensor-side software you use.
+### Offline Data Extraction
 
-## Requirements
+- Extract long-duration recordings from multiple sensors
+- Automatic conversion from SBEM logs to CSV
+- Simultaneous ECG and IMU support
+- Automatic sensor reset after successful extraction
 
-- **macOS** with Bluetooth (tested on Apple Silicon).
-- **Python 3.12** recommended (3.11 also works).
-- Movesense sensors with logging enabled. Software can be found in sensor-software.
+### Live Monitoring
 
-> Windows builds are possible but require different BLE backends; this README focuses on **macOS**.
+- Real-time ECG streaming
+- Live battery status monitoring
+- Direct communication with sensors through the custom WinLogger BLE service
 
+### Data Management
 
-## Quick Start 
-1. **Clone the repository**
+- Dynamic sensor list using CSV mapping
+- Automatic participant-based file naming
+- Batch processing of multiple devices
+- Automated conversion pipeline
+
+### Sensor Software Included
+
+This repository also contains the custom WinLogger sensor software built using the Movesense SDK.
+
+---
+
+## Compatibility
+
+### Desktop Application
+
+- macOS (Apple Silicon tested)
+- Python 3.12 recommended
+
+### Sensor Software
+
+Live ECG streaming and battery monitoring require:
+
+- WinLogger sensor software version **1.7 or newer**
+
+Older versions support offline logging but may not support all live monitoring functionality.
+
+---
+
+## Quick Start
+
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/JonathanPosthuma/movesense-ecg-imu-toolkit.git
+cd movesense-ecg-imu-toolkit
 ```
 
-2. **Launch virtual environment**
+### 2. Activate the virtual environment
 
 ```bash
-cd /movesense-ecg-imu-toolkit
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
-2a. **Launch application**
+### 3. Launch the application
 
 ```bash
 python pc-extractor-parser/main.py
 ```
 
-## OR
+---
 
-2b. **Build the application**
+## Building the macOS Application
 
 ```bash
-pyinstaller --noconfirm --windowed \                                                           
---name "Movesense Toolkit" \
---icon assets/app.icns \
---add-data "icons:icons" \
---add-data "gui:gui" \
---collect-submodules bleak.backends.corebluetooth \
-gui/main_window.py
+pyinstaller --noconfirm --windowed \
+  --name "Movesense Toolkit" \
+  --icon icons/app.icns \
+  --add-data "icons:icons" \
+  --add-data "gui:gui" \
+  --collect-submodules bleak.backends.corebluetooth \
+  gui/main_window.py
 ```
 
-3. **Find and run the application**
+The generated application can be found in:
 
 ```text
-├── pc-extractor-parser
-│   ├── dist
-│   │   ├── Movesense Toolkit
-│   │   └── Movesense Toolkit.app
+pc-extractor-parser/dist/
+└── Movesense Toolkit.app
 ```
+
+---
 
 ## Software Usage
 
-1. **Load sensorID and ParticipantID's list**
-Example CSV can be found (movesense-ecg-imu-toolkit/pc-extractor-parser/test_list.csv)
+### 1. Load Sensor Mapping
 
+Load a CSV containing:
 
-2. **Select output folders**
-Raw data folder will store the raw .SBEM folder whilst the converted folder will contain the converted CSV files
+```text
+sensor_last6,participantID
+```
 
-3. **(Reset sensors)**
-If sensors are still running you can reset them by pressing extract whilst in reset mode.
+Example:
 
-4. **Extract data**
-Click on extract in extract mode. Activate sensors four at a time by touching both pins. After extraction and conversion is completed sensors will be reset and data will be deleted of the sensors.
+```text
+123ABC,PARTICIPANT01
+456DEF,PARTICIPANT02
+```
 
-5. **Sensors are ready for use**
-Sensors are ready to be activated again by connecting both pins; these are very sensitive so try not to let them connect in the mean time. 
+An example file is included:
 
-## Example Output Naming
+```text
+pc-extractor-parser/test_list.csv
+```
 
-Files are saved as:
+---
+
+### 2. Select Output Directories
+
+- Raw Folder → stores downloaded SBEM files
+- Converted Folder → stores processed CSV files
+
+---
+
+### 3. Reset Sensors (Optional)
+
+If sensors are currently recording, switch to Reset Mode and press Extract to reset them.
+
+---
+
+### 4. Extract Offline Data
+
+1. Switch to Extract Mode
+2. Activate up to four sensors simultaneously by touching both electrode pins
+3. Wait for extraction and conversion to complete
+
+After successful extraction:
+
+- Sensors are reset
+- Log data is removed from device memory
+- CSV files are generated automatically
+
+---
+
+### 5. Live ECG Streaming
+
+1. Connect to a WinLogger 1.7 sensor
+2. Start live monitoring
+3. View incoming ECG data in real time
+
+---
+
+### 6. Battery Monitoring
+
+Battery status can be queried directly from connected sensors running WinLogger 1.7 or newer.
+
+---
+
+## Output Naming Convention
+
+Converted files are named:
 
 ```text
 ParticipantID_DDMMYY_day.csv
-e.g., 3VSAN2PR_040625_3.csv
 ```
 
-## Folder Structure
+Example:
+
+```text
+3VSAN2PR_040625_3.csv
+```
+
+---
+
+## Repository Structure
 
 ```text
 movesense-ecg-imu-toolkit/
 ├─ README.md
+├─ CHANGELOG.md
 ├─ requirements.txt
+│
 ├─ fetcher-parser/
 │  ├─ fetch_logbook_data.py
 │  └─ parser_imu_ecg.py
+│
 ├─ pc-extractor-parser/
 │  ├─ DATA/
 │  │  ├─ Raw/
 │  │  └─ Converted/
-│  ├─ assets/
-│  │  └─ app.icns
 │  ├─ conversion/
-│  │  └─ converter.py
 │  ├─ extraction/
-│  │  └─ extractor.py
 │  ├─ gui/
-│  │  └─ main_window.py
 │  ├─ icons/
-│  │  └─ my_icon.png
+│  ├─ dist/
 │  └─ main.py
+│
 └─ sensor-software/
    └─ win_ecglogger_app/
 ```
 
+---
+
 ## Contact
 
-Questions or ideas? Jonathan Posthuma - jonathan.posthuma@ru.nl
+Jonathan Posthuma  
+Radboud University  
+jonathan.posthuma@ru.nl
